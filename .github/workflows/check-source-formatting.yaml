@@ -9,4 +9,4 @@ jobs:
                     java-version: "21"
             -   run: ./gradlew formatSource -Denv.mode.ci=true
 name: Check Source Formatting
-on: [pull_request]
+on: [pull_request, workflow_dispatch]
