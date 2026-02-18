@@ -9,7 +9,6 @@ plugins {
 	id "docker-common"
 	id "docker-database-saas"
 	id "docker-liferay-bundle"
-	id "docker-webserver"
 }
 
 if (Boolean.getBoolean("env.mode.ci")) {
@@ -60,6 +59,16 @@ tasks.register("exportContainerData") {
 		updateGradleLocalProperties(["lr.docker.environment.data.directory" : hostPath])
 
 		logger.lifecycle("\nUpdated gradle-local.properties with the new value:\nlr.docker.environment.data.directory=${hostPath}")
+	}
+}
+
+tasks.register("printWebserverConfig") {
+	onlyIf("using a webserver") {
+		config.useWebserver
+	}
+
+	doFirst {
+		println waitForCommand("docker exec ${config.namespace}-webserver nginx -T")
 	}
 }
 
@@ -263,6 +272,7 @@ buildDockerImage {
 
 	dependsOn ":checkForLiferayLicense"
 	dependsOn ":prepareJDBCDriver"
+	dependsOn ":prepareSAXParser"
 
 	mustRunAfter ":importDatabaseDumps"
 }
@@ -270,8 +280,8 @@ buildDockerImage {
 clean {
 	dependsOn ":cleanPrepareJDBCDriver"
 	dependsOn ":cleanPrepareHotfixes"
-	dependsOn ":cleanPrepareSelfSignedCert"
-	dependsOn ":cleanPrepareWebserverConfig"
+	dependsOn ":cleanPrepareSAXParser"
+	dependsOn ":cleanPrepareXugglerJar"
 	dependsOn ":cleanDownloadYourKitAgentZip"
 	dependsOn ":cleanPrepareYourKitAgent"
 }
@@ -279,12 +289,9 @@ clean {
 dockerDeploy {
 	dependsOn ":prepareJDBCDriver"
 	dependsOn ":prepareHotfixes"
+	dependsOn ":prepareSAXParser"
+	dependsOn ":prepareXugglerJar"
 	dependsOn ":prepareYourKitAgent"
-}
-
-composeBuild {
-	dependsOn ":prepareSelfSignedCert"
-	dependsOn ":prepareWebserverConfig"
 }
 
 composeUp {
@@ -302,6 +309,7 @@ composeUp {
 
 	finalizedBy ":listAdminUsers"
 	finalizedBy ":printBundleInfo"
+	finalizedBy ":printWebserverConfig"
 }
 
 Map<String, String> environmentMap = [:]
@@ -321,6 +329,27 @@ if (config.useLiferay) {
 environmentMap.put("COMPOSE_FILE", config.composeFiles.join(File.pathSeparator))
 environmentMap.put("COMPOSE_PROJECT_NAME", config.namespace)
 
+String validDLStoreTypes = "advanced,db,s3,simple"
+
+if (!validDLStoreTypes.contains(config.dlStore)) {
+	throw new GradleException("Invalid DL store type provided. Please see gradle.properties file for valid store types.")
+}
+
+if (config.dlStore == "advanced") {
+	environmentMap.put("DL_STORE_PATH", config.dlStorePath)
+}
+
+if (config.dlStore == "s3") {
+	environmentMap.put("S3_ACCESS_KEY", config.s3AccessKey)
+	environmentMap.put("S3_BUCKET_NAME", config.s3BucketName)
+	environmentMap.put("S3_REGION", config.s3Region)
+	environmentMap.put("S3_SECRET_KEY", config.s3SecretKey)
+}
+
+environmentMap.put("DL_STORE_CLASS", config.dlStoreClass)
+
+environmentMap.put("MEDIA_PREVIEW_ENABLED", config.mediaPreviewEnabled)
+
 file("ports.env").withInputStream {
 	portsFile ->
 
@@ -329,6 +358,25 @@ file("ports.env").withInputStream {
 	ports.load(portsFile)
 
 	environmentMap.putAll ports
+}
+
+if (config.useWebserver) {
+	environmentMap.put("WEBSERVER_HOSTNAMES", config.webserverHostnames)
+	environmentMap.put("WEBSERVER_MODSECURITY_ENABLED", config.modSecurityEnabled)
+	environmentMap.put("WEBSERVER_PROTOCOL", config.webserverProtocol)
+	environmentMap.put("WEBSERVER_PROTOCOL_UPPERCASE", config.webserverProtocol.toUpperCase())
+
+	if (config.webserverProtocol == "http") {
+		environmentMap.put("WEBSERVER_CONTAINER_PORT", "8080")
+		environmentMap.put("LIFERAY_CONTAINER_PORT", "80")
+		environmentMap.put("WEBSERVER_HOST_PORT", environmentMap["WEBSERVER_HTTP_PORT"])
+	}
+
+	if (config.webserverProtocol == "https") {
+		environmentMap.put("WEBSERVER_CONTAINER_PORT", "8443")
+		environmentMap.put("LIFERAY_CONTAINER_PORT", "443")
+		environmentMap.put("WEBSERVER_HOST_PORT", environmentMap["WEBSERVER_HTTPS_PORT"])
+	}
 }
 
 file("versions.env").withInputStream {

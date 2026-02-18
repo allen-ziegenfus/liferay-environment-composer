@@ -13,11 +13,21 @@ project.plugins.apply "docker-common"
 configurations {
 	db2
 	sqlserver
+	xerces
+	xuggler
 }
 
 dependencies {
 	db2 group: "com.ibm.db2.jcc", name: "db2jcc", version: "db2jcc4"
 	sqlserver group: "com.microsoft.sqlserver", name: "mssql-jdbc", version: "12.10.1.jre11"
+	xerces group: "xerces", name: "xercesImpl", version: "2.12.2"
+	xuggler group: "xuggle", name: "xuggle-xuggler", version: "5.4"
+}
+
+repositories {
+	maven {
+		url "https://maven.dcm4che.org/"
+	}
 }
 
 Closure<Boolean> isValidLicenseFile = {
@@ -136,7 +146,10 @@ Closure<FileCollection> copyLiferayLicenseFromDXPImage = {
 	println "Attempting to copy trial license from ${latestImageName}"
 
 	waitForCommand("docker create --name=${temporaryContainerName} --volume=${temporaryVolumeName}:/opt/liferay/deploy ${latestImageName}")
-	waitForCommand("docker run --rm -v ${temporaryVolumeName}:/source -v ./configs/common/osgi/modules/:/target alpine sh -c 'cp /source/trial-*.xml /target/'")
+
+	File modulesDir = file("${rootProject.projectDir}/configs/common/osgi/modules")
+
+	waitForCommand("docker run --rm -v ${temporaryVolumeName}:/source -v ${modulesDir.absolutePath}:/target alpine sh -c 'cp /source/trial-*.xml /target/'")
 	waitForCommand("docker rm ${temporaryContainerName}")
 	waitForCommand("docker volume rm ${config.namespace}-license")
 
@@ -206,6 +219,36 @@ tasks.register("prepareJDBCDriver", Copy) {
 		dbDriverConfiguration
 	}
 	into "configs/common/tomcat/webapps/ROOT/WEB-INF/shielded-container-lib"
+}
+
+tasks.register("prepareSAXParser", Copy) {
+	onlyIf("using the Liferay service") {
+		config.useLiferay
+	}
+	onlyIf("using Amazon S3 store") {
+		config.dlStore == "s3"
+	}
+
+	from configurations.xerces
+
+	into "configs/common/tomcat/webapps/ROOT/WEB-INF/shielded-container-lib"
+}
+
+tasks.register("prepareXugglerJar", Copy) {
+	onlyIf("using the Liferay service") {
+		config.useLiferay
+	}
+	onlyIf("media preview is enabled") {
+		config.mediaPreviewEnabled
+	}
+	onlyIf("specifying a workspace product version for Liferay 7.3 or older") {
+		!config.is74OrQuarterly
+	}
+
+	from {
+		configurations.findByName("xuggler")
+	}
+	into "configs/common/tomcat/webapps/ROOT/WEB-INF/lib"
 }
 
 tasks.register("validateHotfixURLs") {

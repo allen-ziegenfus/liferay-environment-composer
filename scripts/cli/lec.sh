@@ -158,14 +158,14 @@ _select() {
 	local prompt_message="${1}"
 	shift
 
-	_fzf --prompt "${prompt_message} > " "${@}"
+	_fzf -i --prompt "${prompt_message} > " "${@}"
 }
 
 _selectMultiple() {
 	local prompt_message="${1}"
 	shift
 
-	_fzf --multi --marker="*" --prompt "${prompt_message} > " "${@}"
+	_fzf -i --multi --marker="*" --prompt "${prompt_message} > " "${@}"
 }
 
 #
@@ -873,7 +873,7 @@ cmd_share() {
 	(
 		cd "${PROJECT_DIRECTORY}" || exit
 
-		if [[ "${FLAG_EXPORT}" -gt 1 ]]; then
+		if [[ "${FLAG_EXPORT}" -gt 0 ]]; then
 			_print_step "Exporting container data..."
 
 			if ! ./gradlew exportContainerData --quiet; then
