@@ -2,6 +2,7 @@
 # carries no vendored binary. The release is pinned for reproducibility; bump
 # STERN_VERSION to upgrade. stern is a statically-linked Go binary, so it runs
 # fine on Alpine (musl).
+
 FROM alpine:3.20
 
 ARG STERN_VERSION=1.34.0

@@ -1,354 +1,427 @@
+import groovy.io.FileType
+
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+
 // ============================================================================
 // client-extensions-k8s.gradle
 //
 // Deploy Liferay Client Extensions into the k3s recipe as real Kubernetes
 // workloads. Replaces the podman + kopf operator + CRD + file-watcher.
 //
-//   ./gradlew deployClientExtensions      build/import/apply every CX
-//   ./gradlew renderClientExtensions      dry run: print manifests only
-//   ./gradlew clientExtensionStatus       CRD-style status table (live)
+// ./gradlew deployClientExtensions build/import/apply every CX
+// ./gradlew renderClientExtensions dry run: print manifests only
+// ./gradlew clientExtensionStatus CRD-style status table (live)
 //
 // NO directory convention. CX are discovered recursively under client-extensions:
-//   *.zip                      -> a supplied artifact (unzipped, then imaged)
-//   any dir containing LCP.json -> a built-from-source CX (imaged directly)
+// *.zip -> a supplied artifact (unzipped, then imaged)
+// any dir containing LCP.json -> a built-from-source CX (imaged directly)
 // The virtual instance is an EXTERNAL deploy-time signal (archives only carry
 // the "default" placeholder). Resolution precedence (first match wins):
-//   1. client-extensions/virtual-instances.properties   (<name|sid> = vid)
-//   2. -PvirtualInstance.<name|sid>=vid                  (per-CX property)
-//   3. -PvirtualInstanceId=vid                           (workspace default)
-//   4. "default"                                         (existing workspaces need nothing)
+// 1. client-extensions/virtual-instances.properties (<name|sid> = vid)
+// 2. -PvirtualInstance.<name|sid>=vid (per-CX property)
+// 3. -PvirtualInstanceId=vid (workspace default)
+// 4. "default" (existing workspaces need nothing)
 //
 // Networking is handled by the recipe (NodePort in, CoreDNS->docker-DNS
 // forwarder out), so nothing here needs Liferay's IP or a hostAlias.
 //
 // apply from: 'gradle/client-extensions-k8s.gradle'
 // ============================================================================
-import groovy.io.FileType
-import groovy.json.JsonSlurper
-import groovy.json.JsonOutput
-
-ext.k3s      = project.findProperty('k3s') ?: 'k3s-lec'      // container name (docker exec target)
-ext.k3sHost  = project.findProperty('k3sHost') ?: 'k3s'      // network alias Liferay uses to reach CX
+ext.k3s = project.findProperty('k3s') ?: 'k3s-lec' // container name (docker exec target)
+ext.k3sHost = project.findProperty('k3sHost') ?: 'k3s' // network alias Liferay uses to reach CX
 ext.liferayAddress = project.findProperty('liferayAddress') ?: 'liferay:8080' // socat sidecar target for localhost:80
-ext.cxRoot   = file(project.findProperty('cxRoot') ?: 'client-extensions')
+ext.cxRoot = file(project.findProperty('cxRoot') ?: 'client-extensions')
 ext.CTR_SOCK = '/run/k3s/containerd/containerd.sock'
 
 // The agent names dxp/ext-init ConfigMaps by the instance webId (company.getWebId()).
 // Resolve it the same way Liferay does: -PwebId override > company.default.web.id
 // in portal-ext.properties > "liferay.com" (Liferay's own default). No DB needed.
 def resolveWebId() {
-    def override = project.findProperty('webId')
-    if (override) return override
-    def pep = file('configs/common/portal-ext.properties')
-    if (pep.exists()) {
-        def m = (pep.text =~ /(?m)^[ \t]*company\.default\.web\.id[ \t]*=[ \t]*(\S+)/)
-        if (m.find()) return m.group(1)
-    }
-    return 'liferay.com'
+	def override = project.findProperty('webId')
+	if (override) return override
+	def pep = file('configs/common/portal-ext.properties')
+	if (pep.exists()) {
+		def m = (pep.text =~ /(?m)^[ \t]*company\.default\.web\.id[ \t]*=[ \t]*(\S+)/)
+		if (m.find()) return m.group(1)
+
+}
+	return 'liferay.com'
 }
 ext.webId = resolveWebId()
 
-def managedKey() { 'lxc.liferay.com/managed' }
+def managedKey() {
+			'lxc.liferay.com/managed'
+		}
 
-// ---- discovery: source (dir w/ LCP.json) OR artifact (*.zip), any layout ----
-def discoverClientExtensions() {
-    def out = []
-    if (!cxRoot.isDirectory()) return out
-    cxRoot.eachFileRecurse(FileType.FILES) { if (it.name.endsWith('.zip')) out << it }
-    cxRoot.traverse(type: FileType.DIRECTORIES) { if (new File(it, 'LCP.json').exists()) out << it }
-    return out
+		// ---- discovery: source (dir w/ LCP.json) OR artifact (*.zip), any layout ----
+		def discoverClientExtensions() {
+			def out = []
+			if (!cxRoot.isDirectory()) return out
+	cxRoot.eachFileRecurse(FileType.FILES) {
+				if (it.name.endsWith('.zip')) out << it
+}
+	cxRoot.traverse(type: FileType.DIRECTORIES) {
+					if (new File(it, 'LCP.json').exists()) out << it
+}
+	return out
 }
 
 // Normalize an entry to a directory that has LCP.json. Only place zip-vs-source matters.
 def materialize(File entry) {
-    if (entry.isDirectory()) return entry
-    def dest = new File(buildDir, "cx/${entry.name - '.zip'}")
-    delete dest; copy { from zipTree(entry); into dest }
-    return dest
+						if (entry.isDirectory()) return entry
+	def dest = new File(buildDir, "cx/${entry.name - '.zip'}")
+	delete dest; copy {
+							from zipTree(entry); into dest
+						}
+						return dest
+					}
+
+					// External VI signal (archives only carry the "default" placeholder), resolved
+					// by precedence: file mapping > per-CX property > workspace default > "default".
+					ext.viMappingFile = file(project.findProperty('viMapping') ?: new File(cxRoot, 'virtual-instances.properties'))
+
+					def loadViMap() {
+						def p = new Properties()
+						if (viMappingFile.exists()) viMappingFile.withInputStream {
+							p.load(it)
+						}
+						return p
+					}
+
+					def resolveVirtualInstance(String sid, String name) {
+						def map = loadViMap()
+						return map.getProperty(name) ?: map.getProperty(sid) ?:
+						project.findProperty("virtualInstance.${name}") ?: project.findProperty("virtualInstance.${sid}") ?:
+						project.findProperty('virtualInstanceId') ?: 'default'
+					}
+
+					def nodePortFor(String sid) {
+						30000 + (Math.abs(sid.hashCode()) % 2500)
+					}
+
+					// Build the k8s manifests for one CX. The NodePort is left for k8s to assign
+					// (unique + sticky across redeploys — no hash, no collisions), so the Service is
+					// applied first and its port read back before the ext-provision ConfigMap (which
+					// needs the address) is rendered. Serving CX also get an Ingress on
+					// <sid>.<vid>.localtest.me so a browser can reach them (CORS-correct origin).
+					def manifestFor(File dir, String name) {
+						def lcp = new JsonSlurper().parse(new File(dir, 'LCP.json'))
+						def sid = lcp.id
+						def vid = resolveVirtualInstance(sid, name)
+						def image = "lxc/${sid}:latest" // vid-independent: one image, registration carries the VI
+						def isJob = (lcp.kind ?: 'Deployment').toString().equalsIgnoreCase('job')
+						def port = lcp.loadBalancer?.targetPort
+						def hasService = (port && !isJob) as boolean
+						def ingressHost = hasService ? "${sid}.${vid}.localtest.me" : null
+						def ingressUrl = ingressHost ? "http://${ingressHost}" : null
+						def sel = [app: sid, domain: vid]
+
+						def container = [
+							name: 'main', image: image, imagePullPolicy: 'IfNotPresent',
+							env: (lcp.env ?: [:]).collect {
+								k, v -> [name: k, value: v.toString()]
+							},
+							volumeMounts: [
+								[name: 'ext-provision', mountPath: '/etc/liferay/lxc/ext-provision-metadata', readOnly: true],
+								[name: 'dxp', mountPath: '/etc/liferay/lxc/dxp-metadata', readOnly: true],
+								[name: 'ext-init', mountPath: '/etc/liferay/lxc/ext-init-metadata', readOnly: true],
+							],
+						]
+						if (port) container.ports = [[containerPort: port]]
+	if (lcp.livenessProbe) container.livenessProbe = lcp.livenessProbe
+	if (lcp.readinessProbe) container.readinessProbe = lcp.readinessProbe
+
+	// OAuth CX expect the portal at localhost:80; bridge to liferay:8080 with a
+	// socat sidecar (see the kopf operator; "liferay" resolves via the forwarder).
+	def needsLiferay = dir.listFiles({
+							f -> f.name.endsWith('.client-extension-config.json')
+						} as FileFilter)?.any {
+						cf ->
+						new JsonSlurper().parse(cf).values().any {
+							it instanceof Map &&
+							(it.type == 'oAuthApplicationUserAgent' || it.type == 'oAuthApplicationHeadlessServer')
+						}
+
+					} ?: false
+					def podSpec = [
+						containers: [container],
+						volumes: [
+							[name: 'ext-provision', configMap: [name: "${sid}-ext-provision"]],
+							// dxp + ext-init are created by PortalK8sAgent AFTER registration, named
+							// by the instance webId; mounted optional so the pod starts, kubelet syncs
+							// them in once the agent creates them.
+							[name: 'dxp', configMap: [name: "${webId}-lxc-dxp-metadata", optional: true]],
+							[name: 'ext-init', configMap: [name: "${sid}-${webId}-lxc-ext-init-metadata", optional: true]],
+						],
+					]
+					// socat bridge as a NATIVE sidecar (initContainer + restartPolicy: Always):
+					// starts before main, is torn down when main exits, and does NOT block Job
+					// completion — so one-shot/noop CX (kind: Job) complete instead of hanging at 1/2.
+					if (needsLiferay) podSpec.initContainers = [[
+		name: 'liferay-proxy', image: 'alpine/socat:latest', imagePullPolicy: 'IfNotPresent',
+		restartPolicy: 'Always',
+		args: ['TCP-LISTEN:80,fork,reuseaddr', "TCP:${liferayAddress}"],
+	]]
+
+	def anno = ['lxc.liferay.com/app-id': sid, 'lxc.liferay.com/virtual-instance': vid]
+	if (ingressUrl) anno['lxc.liferay.com/url'] = ingressUrl
+	def baseMeta = {
+						extra -> [labels: [(managedKey()): 'true'] + sel] + extra
+					}
+
+					// Phase 1: the Service alone, WITHOUT nodePort -> k8s assigns a unique, sticky one.
+					def serviceJson = null
+					if (hasService)
+		serviceJson = JsonOutput.toJson([apiVersion: 'v1', kind: 'Service',
+			metadata: baseMeta([name: sid]),
+			spec: [type: 'NodePort', selector: sel, ports: [[port: port, targetPort: port]]]])
+
+	// Phase 2: workload + Ingress + ext-provision CM, rendered once nodePort is known.
+	def restFor = {
+						np ->
+						def items = []
+						if (isJob) {
+							podSpec.restartPolicy = 'Never'
+							items << [apiVersion: 'batch/v1', kind: 'Job',
+								metadata: baseMeta([name: sid, annotations: anno]),
+								spec: [backoffLimit: 6, ttlSecondsAfterFinished: 600,
+									template: [metadata: [labels: [(managedKey()): 'true'] + sel], spec: podSpec]]]
+						} else {
+							items << [apiVersion: 'apps/v1', kind: 'Deployment',
+								metadata: baseMeta([name: sid, annotations: anno]),
+								spec: [replicas: (lcp.scale ?: 1), selector: [matchLabels: sel],
+									template: [metadata: [labels: [(managedKey()): 'true'] + sel], spec: podSpec]]]
+							if (hasService)
+				items << [apiVersion: 'networking.k8s.io/v1', kind: 'Ingress',
+						  metadata: baseMeta([name: sid]),
+						  spec: [ingressClassName: 'traefik',
+								 rules: [[host: ingressHost, http: [paths: [[path: '/', pathType: 'Prefix',
+										  backend: [service: [name: sid, port: [number: port]]]]]]]]]]
+
 }
 
-// External VI signal (archives only carry the "default" placeholder), resolved
-// by precedence: file mapping > per-CX property > workspace default > "default".
-ext.viMappingFile = file(project.findProperty('viMapping') ?: new File(cxRoot, 'virtual-instances.properties'))
+		// ext-provision ConfigMap = the registration PortalK8sAgent reads. Browser
+		// origin -> ingress URL (CORS); Liferay backend calls -> k3s:<nodePort>.
+		def serviceAddr = np ? "${k3sHost}:${np}" : null
+		def data = [:]
+		dir.listFiles({
+								f -> f.name.endsWith('.client-extension-config.json')
+							} as FileFilter)?.each {
+							cf ->
+							def cfg = new JsonSlurper().parse(cf)
+							cfg.each {
+								_, v ->
+								if (v instanceof Map) {
+									if (ingressUrl && v.containsKey('baseURL')) v.baseURL = ingressUrl
+					if (ingressUrl && v.containsKey('homePageURL')) v.homePageURL = ingressUrl
+					if (serviceAddr && v.containsKey('.serviceAddress')) v['.serviceAddress'] = serviceAddr
 
-def loadViMap() {
-    def p = new Properties()
-    if (viMappingFile.exists()) viMappingFile.withInputStream { p.load(it) }
-    return p
 }
 
-def resolveVirtualInstance(String sid, String name) {
-    def map = loadViMap()
-    return map.getProperty(name) ?: map.getProperty(sid) ?:
-           project.findProperty("virtualInstance.${name}") ?: project.findProperty("virtualInstance.${sid}") ?:
-           project.findProperty('virtualInstanceId') ?: 'default'
+}
+			data[cf.name] = JsonOutput.toJson(cfg)
+
+}
+		items << [apiVersion: 'v1', kind: 'ConfigMap',
+				  metadata: [name: "${sid}-ext-provision",
+							 labels: [(managedKey()): 'true',
+									  'lxc.liferay.com/metadataType': 'ext-provision',
+									  'dxp.lxc.liferay.com/virtualInstanceId': vid,
+									  'ext.lxc.liferay.com/serviceId': sid],
+							 annotations: ['lxc.liferay.com/lcp-json': JsonOutput.toJson(lcp)]],
+				  data: data]
+		return JsonOutput.toJson([apiVersion: 'v1', kind: 'List', items: items])
+
 }
 
-def nodePortFor(String sid) { 30000 + (Math.abs(sid.hashCode()) % 2500) }
-
-// Build the k8s manifests for one CX. The NodePort is left for k8s to assign
-// (unique + sticky across redeploys — no hash, no collisions), so the Service is
-// applied first and its port read back before the ext-provision ConfigMap (which
-// needs the address) is rendered. Serving CX also get an Ingress on
-// <sid>.<vid>.localtest.me so a browser can reach them (CORS-correct origin).
-def manifestFor(File dir, String name) {
-    def lcp   = new JsonSlurper().parse(new File(dir, 'LCP.json'))
-    def sid   = lcp.id
-    def vid   = resolveVirtualInstance(sid, name)
-    def image = "lxc/${sid}:latest"                 // vid-independent: one image, registration carries the VI
-    def isJob = (lcp.kind ?: 'Deployment').toString().equalsIgnoreCase('job')
-    def port  = lcp.loadBalancer?.targetPort
-    def hasService  = (port && !isJob) as boolean
-    def ingressHost = hasService ? "${sid}.${vid}.localtest.me" : null
-    def ingressUrl  = ingressHost ? "http://${ingressHost}" : null
-    def sel   = [app: sid, domain: vid]
-
-    def container = [
-        name: 'main', image: image, imagePullPolicy: 'IfNotPresent',
-        env: (lcp.env ?: [:]).collect { k, v -> [name: k, value: v.toString()] },
-        volumeMounts: [
-            [name: 'ext-provision', mountPath: '/etc/liferay/lxc/ext-provision-metadata', readOnly: true],
-            [name: 'dxp',           mountPath: '/etc/liferay/lxc/dxp-metadata',           readOnly: true],
-            [name: 'ext-init',      mountPath: '/etc/liferay/lxc/ext-init-metadata',      readOnly: true],
-        ],
-    ]
-    if (port) container.ports = [[containerPort: port]]
-    if (lcp.livenessProbe)  container.livenessProbe  = lcp.livenessProbe
-    if (lcp.readinessProbe) container.readinessProbe = lcp.readinessProbe
-
-    // OAuth CX expect the portal at localhost:80; bridge to liferay:8080 with a
-    // socat sidecar (see the kopf operator; "liferay" resolves via the forwarder).
-    def needsLiferay = dir.listFiles({ f -> f.name.endsWith('.client-extension-config.json') } as FileFilter)?.any { cf ->
-        new JsonSlurper().parse(cf).values().any { it instanceof Map &&
-            (it.type == 'oAuthApplicationUserAgent' || it.type == 'oAuthApplicationHeadlessServer') }
-    } ?: false
-    def podSpec = [
-        containers: [container],
-        volumes: [
-            [name: 'ext-provision', configMap: [name: "${sid}-ext-provision"]],
-            // dxp + ext-init are created by PortalK8sAgent AFTER registration, named
-            // by the instance webId; mounted optional so the pod starts, kubelet syncs
-            // them in once the agent creates them.
-            [name: 'dxp',      configMap: [name: "${webId}-lxc-dxp-metadata",            optional: true]],
-            [name: 'ext-init', configMap: [name: "${sid}-${webId}-lxc-ext-init-metadata", optional: true]],
-        ],
-    ]
-    // socat bridge as a NATIVE sidecar (initContainer + restartPolicy: Always):
-    // starts before main, is torn down when main exits, and does NOT block Job
-    // completion — so one-shot/noop CX (kind: Job) complete instead of hanging at 1/2.
-    if (needsLiferay) podSpec.initContainers = [[
-        name: 'liferay-proxy', image: 'alpine/socat:latest', imagePullPolicy: 'IfNotPresent',
-        restartPolicy: 'Always',
-        args: ['TCP-LISTEN:80,fork,reuseaddr', "TCP:${liferayAddress}"],
-    ]]
-
-    def anno = ['lxc.liferay.com/app-id': sid, 'lxc.liferay.com/virtual-instance': vid]
-    if (ingressUrl) anno['lxc.liferay.com/url'] = ingressUrl
-    def baseMeta = { extra -> [labels: [(managedKey()): 'true'] + sel] + extra }
-
-    // Phase 1: the Service alone, WITHOUT nodePort -> k8s assigns a unique, sticky one.
-    def serviceJson = null
-    if (hasService)
-        serviceJson = JsonOutput.toJson([apiVersion: 'v1', kind: 'Service',
-            metadata: baseMeta([name: sid]),
-            spec: [type: 'NodePort', selector: sel, ports: [[port: port, targetPort: port]]]])
-
-    // Phase 2: workload + Ingress + ext-provision CM, rendered once nodePort is known.
-    def restFor = { np ->
-        def items = []
-        if (isJob) {
-            podSpec.restartPolicy = 'Never'
-            items << [apiVersion: 'batch/v1', kind: 'Job',
-                      metadata: baseMeta([name: sid, annotations: anno]),
-                      spec: [backoffLimit: 6, ttlSecondsAfterFinished: 600,
-                             template: [metadata: [labels: [(managedKey()): 'true'] + sel], spec: podSpec]]]
-        } else {
-            items << [apiVersion: 'apps/v1', kind: 'Deployment',
-                      metadata: baseMeta([name: sid, annotations: anno]),
-                      spec: [replicas: (lcp.scale ?: 1), selector: [matchLabels: sel],
-                             template: [metadata: [labels: [(managedKey()): 'true'] + sel], spec: podSpec]]]
-            if (hasService)
-                items << [apiVersion: 'networking.k8s.io/v1', kind: 'Ingress',
-                          metadata: baseMeta([name: sid]),
-                          spec: [ingressClassName: 'traefik',
-                                 rules: [[host: ingressHost, http: [paths: [[path: '/', pathType: 'Prefix',
-                                          backend: [service: [name: sid, port: [number: port]]]]]]]]]]
-        }
-
-        // ext-provision ConfigMap = the registration PortalK8sAgent reads. Browser
-        // origin -> ingress URL (CORS); Liferay backend calls -> k3s:<nodePort>.
-        def serviceAddr = np ? "${k3sHost}:${np}" : null
-        def data = [:]
-        dir.listFiles({ f -> f.name.endsWith('.client-extension-config.json') } as FileFilter)?.each { cf ->
-            def cfg = new JsonSlurper().parse(cf)
-            cfg.each { _, v ->
-                if (v instanceof Map) {
-                    if (ingressUrl && v.containsKey('baseURL'))          v.baseURL = ingressUrl
-                    if (ingressUrl && v.containsKey('homePageURL'))      v.homePageURL = ingressUrl
-                    if (serviceAddr && v.containsKey('.serviceAddress')) v['.serviceAddress'] = serviceAddr
-                }
-            }
-            data[cf.name] = JsonOutput.toJson(cfg)
-        }
-        items << [apiVersion: 'v1', kind: 'ConfigMap',
-                  metadata: [name: "${sid}-ext-provision",
-                             labels: [(managedKey()): 'true',
-                                      'lxc.liferay.com/metadataType': 'ext-provision',
-                                      'dxp.lxc.liferay.com/virtualInstanceId': vid,
-                                      'ext.lxc.liferay.com/serviceId': sid],
-                             annotations: ['lxc.liferay.com/lcp-json': JsonOutput.toJson(lcp)]],
-                  data: data]
-        return JsonOutput.toJson([apiVersion: 'v1', kind: 'List', items: items])
-    }
-
-    return [sid: sid, vid: vid, image: image, isJob: isJob, needsLiferay: needsLiferay,
-            hasService: hasService, ingressUrl: ingressUrl, serviceJson: serviceJson, restFor: restFor]
+	return [sid: sid, vid: vid, image: image, isJob: isJob, needsLiferay: needsLiferay,
+			hasService: hasService, ingressUrl: ingressUrl, serviceJson: serviceJson, restFor: restFor]
 }
 
 def kubectlApply(String json) {
-    exec {
-        commandLine 'docker', 'exec', '-i', k3s, 'kubectl', 'apply', '-f', '-'
-        standardInput = new ByteArrayInputStream(json.getBytes('UTF-8'))
-    }
-}
+										exec {
+											commandLine 'docker', 'exec', '-i', k3s, 'kubectl', 'apply', '-f', '-'
+											standardInput = new ByteArrayInputStream(json.getBytes('UTF-8'))
+										}
+									}
 
-// Build (or unpack) -> image -> import -> apply -> restart, for ONE client
-// extension. Reused by deployClientExtensions and each module's deployToK3s.
-ext.deployOneCx = { File entry ->
-    def name = entry.isDirectory() ? entry.name : (entry.name - '.zip')
-    def dir = materialize(entry)
-    if (!new File(dir, 'LCP.json').exists()) { logger.warn("skip ${entry.name}: no LCP.json"); return }
-    def m = manifestFor(dir, name)
-    logger.lifecycle(">> ${m.vid}/${m.sid}  (image ${m.image})")
-    if (m.needsLiferay) exec { commandLine 'bash', '-c',
-        "docker image inspect alpine/socat:latest >/dev/null 2>&1 || docker pull -q alpine/socat:latest; " +
-        "docker save alpine/socat:latest | docker exec -i ${k3s} ctr -a ${CTR_SOCK} -n k8s.io images import -" }
-    exec { commandLine 'docker', 'build', '-q', '-t', m.image, dir.absolutePath }
-    exec { commandLine 'bash', '-c',
-           "docker save ${m.image} | docker exec -i ${k3s} ctr -a ${CTR_SOCK} -n k8s.io images import -" }
-    // Phase 1: apply the Service so k8s assigns the NodePort, then read it back.
-    def np = null
-    if (m.hasService) {
-        kubectlApply(m.serviceJson)
-        def out = new ByteArrayOutputStream()
-        exec { commandLine 'docker', 'exec', k3s, 'kubectl', 'get', 'svc', m.sid,
-                           '-o', 'jsonpath={.spec.ports[0].nodePort}'
-               standardOutput = out }
-        np = out.toString().trim().toInteger()
-    }
-    // Phase 2: workload + Ingress + ext-provision CM (with the resolved address).
-    // :latest tag => apply won't roll; Jobs delete+recreate, Deployments rollout restart.
-    if (m.isJob) exec { commandLine 'docker', 'exec', k3s, 'kubectl', 'delete', 'job', m.sid, '--ignore-not-found' }
-    kubectlApply(m.restFor(np))
-    if (!m.isJob) exec { ignoreExitValue = true
-        commandLine 'docker', 'exec', k3s, 'kubectl', 'rollout', 'restart', "deployment/${m.sid}" }
-    if (m.hasService) logger.lifecycle("   browser: ${m.ingressUrl}   |  Liferay: ${k3sHost}:${np}")
+									// Build (or unpack) -> image -> import -> apply -> restart, for ONE client
+									// extension. Reused by deployClientExtensions and each module's deployToK3s.
+									ext.deployOneCx = {
+										File entry ->
+										def name = entry.isDirectory() ? entry.name : (entry.name - '.zip')
+										def dir = materialize(entry)
+										if (!new File(dir, 'LCP.json').exists()) {
+											logger.warn("skip ${entry.name}: no LCP.json"); return
+										}
+										def m = manifestFor(dir, name)
+										logger.lifecycle(">> ${m.vid}/${m.sid}  (image ${m.image})")
+										if (m.needsLiferay) exec {
+											commandLine 'bash', '-c',
+		"docker image inspect alpine/socat:latest >/dev/null 2>&1 || docker pull -q alpine/socat:latest; " +
+											"docker save alpine/socat:latest | docker exec -i ${k3s} ctr -a ${CTR_SOCK} -n k8s.io images import -"
+										}
+										exec {
+											commandLine 'docker', 'build', '-q', '-t', m.image, dir.absolutePath
+										}
+										exec {
+											commandLine 'bash', '-c',
+											"docker save ${m.image} | docker exec -i ${k3s} ctr -a ${CTR_SOCK} -n k8s.io images import -"
+										}
+										// Phase 1: apply the Service so k8s assigns the NodePort, then read it back.
+										def np = null
+										if (m.hasService) {
+											kubectlApply(m.serviceJson)
+											def out = new ByteArrayOutputStream()
+											exec {
+												commandLine 'docker', 'exec', k3s, 'kubectl', 'get', 'svc', m.sid,
+												'-o', 'jsonpath={.spec.ports[0].nodePort}'
+												standardOutput = out
+											}
+											np = out.toString().trim().toInteger()
+										}
+										// Phase 2: workload + Ingress + ext-provision CM (with the resolved address).
+										// :latest tag => apply won't roll; Jobs delete+recreate, Deployments rollout restart.
+										if (m.isJob) exec {
+											commandLine 'docker', 'exec', k3s, 'kubectl', 'delete', 'job', m.sid, '--ignore-not-found'
+										}
+										kubectlApply(m.restFor(np))
+										if (!m.isJob) exec {
+											ignoreExitValue = true
+											commandLine 'docker', 'exec', k3s, 'kubectl', 'rollout', 'restart', "deployment/${m.sid}"
+										}
+										if (m.hasService) logger.lifecycle("   browser: ${m.ingressUrl}   |  Liferay: ${k3sHost}:${np}")
 }
 
 // ---- tasks -----------------------------------------------------------------
 
 tasks.register('deployClientExtensions') {
-    group = 'liferay k8s'
-    description = 'Build (or unpack) each Client Extension and deploy it into k3s.'
-    doLast {
-        discoverClientExtensions().each { deployOneCx(it) }
-    }
+											group = 'liferay k8s'
+											description = 'Build (or unpack) each Client Extension and deploy it into k3s.'
+											doLast {
+												discoverClientExtensions().each {
+													deployOneCx(it)
+												}
+											}
+										}
+
+										// Per-CX convenience: from a CX module dir, `../../gradlew deployToK3s` rebuilds
+										// just that CX and rolls its pod (build -> image -> import -> apply -> restart).
+										gradle.projectsEvaluated {
+											rootProject.allprojects.each {
+												p ->
+												def zipTask = p.tasks.findByName('buildClientExtensionZip')
+												if (!zipTask) return
+		p.tasks.register('deployToK3s') {
+													group = 'liferay k8s'
+													description = 'Rebuild this client extension and (re)deploy + restart it in k3s.'
+													dependsOn zipTask
+													doLast {
+														def zip = zipTask.outputs.files.files.find {
+															it.name.endsWith('.zip')
+														}
+														if (!zip) throw new GradleException("no built zip from ${zipTask.path}")
+				rootProject.deployOneCx(zip)
+
 }
 
-// Per-CX convenience: from a CX module dir, `../../gradlew deployToK3s` rebuilds
-// just that CX and rolls its pod (build -> image -> import -> apply -> restart).
-gradle.projectsEvaluated {
-    rootProject.allprojects.each { p ->
-        def zipTask = p.tasks.findByName('buildClientExtensionZip')
-        if (!zipTask) return
-        p.tasks.register('deployToK3s') {
-            group = 'liferay k8s'
-            description = 'Rebuild this client extension and (re)deploy + restart it in k3s.'
-            dependsOn zipTask
-            doLast {
-                def zip = zipTask.outputs.files.files.find { it.name.endsWith('.zip') }
-                if (!zip) throw new GradleException("no built zip from ${zipTask.path}")
-                rootProject.deployOneCx(zip)
-            }
-        }
-    }
+}
+
+}
 }
 
 tasks.register('renderClientExtensions') {
-    group = 'liferay k8s'
-    description = 'Print the manifests that would be applied (no docker, no cluster).'
-    doLast {
-        discoverClientExtensions().each { entry ->
-            def name = entry.isDirectory() ? entry.name : (entry.name - '.zip')
-            def dir = materialize(entry)
-            if (!new File(dir, 'LCP.json').exists()) return
-            def m = manifestFor(dir, name)
-            def np = m.hasService ? nodePortFor(m.sid) : null   // preview only; real port is k8s-assigned
-            println "# ===== ${m.vid}/${m.sid}  image=${m.image}  ingress=${m.ingressUrl} ====="
-            if (m.serviceJson) println JsonOutput.prettyPrint(m.serviceJson)
-            println JsonOutput.prettyPrint(m.restFor(np))
-        }
-    }
+															group = 'liferay k8s'
+															description = 'Print the manifests that would be applied (no docker, no cluster).'
+															doLast {
+																discoverClientExtensions().each {
+																	entry ->
+																	def name = entry.isDirectory() ? entry.name : (entry.name - '.zip')
+																	def dir = materialize(entry)
+																	if (!new File(dir, 'LCP.json').exists()) return
+			def m = manifestFor(dir, name)
+			def np = m.hasService ? nodePortFor(m.sid) : null // preview only; real port is k8s-assigned
+			println "# ===== ${m.vid}/${m.sid}  image=${m.image}  ingress=${m.ingressUrl} ====="
+			if (m.serviceJson) println JsonOutput.prettyPrint(m.serviceJson)
+			println JsonOutput.prettyPrint(m.restFor(np))
+
+}
+
+}
 }
 
 // Reproduces the old CRD printer columns (Phase / App-ID / URL / Image) — but
 // live, read from the native objects instead of an operator-maintained status.
 tasks.register('clientExtensionStatus') {
-    group = 'liferay k8s'
-    description = 'Show a CRD-style status table for deployed Client Extensions.'
-    doLast {
-        exec { commandLine 'docker', 'exec', k3s, 'kubectl', 'get', 'deploy,job',
-            '-l', managedKey(),
-            '-o', 'custom-columns=' +
-                'NAME:.metadata.name,' +
-                'APP-ID:.metadata.annotations.lxc\\.liferay\\.com/app-id,' +
-                'INSTANCE:.metadata.annotations.lxc\\.liferay\\.com/virtual-instance,' +
-                'READY:.status.readyReplicas,' +
-                'URL:.metadata.annotations.lxc\\.liferay\\.com/url,' +
-                'IMAGE:.spec.template.spec.containers[0].image' }
-    }
-}
+																		group = 'liferay k8s'
+																		description = 'Show a CRD-style status table for deployed Client Extensions.'
+																		doLast {
+																			exec {
+																				commandLine 'docker', 'exec', k3s, 'kubectl', 'get', 'deploy,job',
+																				'-l', managedKey(),
+			'-o', 'custom-columns=' +
+				'NAME:.metadata.name,' +
+				'APP-ID:.metadata.annotations.lxc\\.liferay\\.com/app-id,' +
+				'INSTANCE:.metadata.annotations.lxc\\.liferay\\.com/virtual-instance,' +
+				'READY:.status.readyReplicas,' +
+				'URL:.metadata.annotations.lxc\\.liferay\\.com/url,' +
+																				'IMAGE:.spec.template.spec.containers[0].image'
+																			}
+																		}
+																	}
 
-// Deploy a minimal traefik ingress controller DIRECTLY (image pre-imported so the
-// pod never pulls). Lean alternative to k3s's built-in traefik/helm-controller.
-// CX deploys depend on it so the <sid>.<vid>.localtest.me Ingresses have a router.
-ext.TRAEFIK_IMAGE = 'traefik:v3.1'
-tasks.register('deployIngress') {
-    group = 'liferay k8s'
-    description = 'Deploy a minimal traefik ingress controller (hostPort 80) into k3s.'
-    doLast {
-        exec { commandLine 'bash', '-c',
-            "docker image inspect ${TRAEFIK_IMAGE} >/dev/null 2>&1 || docker pull -q ${TRAEFIK_IMAGE}; " +
-            "docker save ${TRAEFIK_IMAGE} | docker exec -i ${k3s} ctr -a ${CTR_SOCK} -n k8s.io images import -" }
-        kubectlApply(file('compose-recipes/k3s/traefik.yaml').text)
-        exec { ignoreExitValue = true
-            commandLine 'docker', 'exec', k3s, 'kubectl', '-n', 'kube-system',
-                        'rollout', 'status', 'deploy/traefik', '--timeout=90s' }
-    }
-}
-tasks.matching { it.name == 'deployClientExtensions' }.all { it.dependsOn 'deployIngress' }
+																	// Deploy a minimal traefik ingress controller DIRECTLY (image pre-imported so the
+																	// pod never pulls). Lean alternative to k3s's built-in traefik/helm-controller.
+																	// CX deploys depend on it so the <sid>.<vid>.localtest.me Ingresses have a router.
+																	ext.TRAEFIK_IMAGE = 'traefik:v3.1'
+																	tasks.register('deployIngress') {
+																		group = 'liferay k8s'
+																		description = 'Deploy a minimal traefik ingress controller (hostPort 80) into k3s.'
+																		doLast {
+																			exec {
+																				commandLine 'bash', '-c',
+			"docker image inspect ${TRAEFIK_IMAGE} >/dev/null 2>&1 || docker pull -q ${TRAEFIK_IMAGE}; " +
+																				"docker save ${TRAEFIK_IMAGE} | docker exec -i ${k3s} ctr -a ${CTR_SOCK} -n k8s.io images import -"
+																			}
+																			kubectlApply(file('compose-recipes/k3s/traefik.yaml').text)
+																			exec {
+																				ignoreExitValue = true
+																				commandLine 'docker', 'exec', k3s, 'kubectl', '-n', 'kube-system',
+																				'rollout', 'status', 'deploy/traefik', '--timeout=90s'
+																			}
+																		}
+																	}
+																	tasks.matching { it.name == 'deployClientExtensions' }.all {
+																		it.dependsOn 'deployIngress'
+																	}
 
-// Connect to the cluster from the host: writes a kubeconfig pointing at the k3s
-// container's IP (reachable directly on Linux; the k3s serving cert already lists
-// that IP). Re-run after a restart (the container IP can change).
-tasks.register('k3sKubeconfig') {
-    group = 'liferay k8s'
-    description = 'Write a host kubeconfig for the k3s cluster to build/kubeconfig.'
-    doLast {
-        def ipOut = new ByteArrayOutputStream()
-        exec { commandLine 'docker', 'inspect', '-f',
-               '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}', k3s
-               standardOutput = ipOut }
-        def cip = ipOut.toString().trim()
-        if (!cip) throw new GradleException("k3s container '${k3s}' is not running")
-        def cfgOut = new ByteArrayOutputStream()
-        exec { commandLine 'docker', 'exec', k3s, 'cat', '/etc/rancher/k3s/k3s.yaml'
-               standardOutput = cfgOut }
-        def out = file("${buildDir}/kubeconfig")
-        out.parentFile.mkdirs()
-        out.text = cfgOut.toString().replace('127.0.0.1', cip)
-        logger.lifecycle("kubeconfig written: ${out}  (server https://${cip}:6443)")
-        logger.lifecycle("  export KUBECONFIG=${out}")
-        logger.lifecycle("  kubectl get pods -A")
-    }
-}
+																	// Connect to the cluster from the host: writes a kubeconfig pointing at the k3s
+																	// container's IP (reachable directly on Linux; the k3s serving cert already lists
+																	// that IP). Re-run after a restart (the container IP can change).
+																	tasks.register('k3sKubeconfig') {
+																		group = 'liferay k8s'
+																		description = 'Write a host kubeconfig for the k3s cluster to build/kubeconfig.'
+																		doLast {
+																			def ipOut = new ByteArrayOutputStream()
+																			exec {
+																				commandLine 'docker', 'inspect', '-f',
+																				'{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}', k3s
+																				standardOutput = ipOut
+																			}
+																			def cip = ipOut.toString().trim()
+																			if (!cip) throw new GradleException("k3s container '${k3s}' is not running")
+		def cfgOut = new ByteArrayOutputStream()
+		exec {
+																				commandLine 'docker', 'exec', k3s, 'cat', '/etc/rancher/k3s/k3s.yaml'
+																				standardOutput = cfgOut
+																			}
+																			def out = file("${buildDir}/kubeconfig")
+																			out.parentFile.mkdirs()
+																			out.text = cfgOut.toString().replace('127.0.0.1', cip)
+																			logger.lifecycle("kubeconfig written: ${out}  (server https://${cip}:6443)")
+																			logger.lifecycle("  export KUBECONFIG=${out}")
+																			logger.lifecycle("  kubectl get pods -A")
+
+																		}
+																	}

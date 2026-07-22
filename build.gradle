@@ -479,7 +479,9 @@ if (config.services.contains("k3s")) {
 	tasks.matching { it.name == "deployClientExtensions" }.all {
 		deployTask ->
 
-		tasks.matching { it.name == "start" }.all { it.finalizedBy deployTask }
+		tasks.matching { it.name == "start" }.all {
+			it.finalizedBy deployTask
+		}
 	}
 
 	// Build source CX and stage their zips into client-extensions/liferay.com so
@@ -488,7 +490,9 @@ if (config.services.contains("k3s")) {
 		group = "liferay k8s"
 		description = "Build source CX and copy their zips into client-extensions/liferay.com."
 		into "client-extensions/liferay.com"
-		eachFile { it.path = it.name }
+		eachFile {
+			it.path = it.name
+		}
 		includeEmptyDirs = false
 	}
 
@@ -496,12 +500,16 @@ if (config.services.contains("k3s")) {
 		def zipTasks = allprojects.collectMany {
 			p ->
 
-			p.tasks.findAll { it.name == "buildClientExtensionZip" }
+			p.tasks.findAll {
+				it.name == "buildClientExtensionZip"
+			}
 		}
 
 		tasks.named("stageClientExtensions").configure {
 			dependsOn zipTasks
-			from zipTasks.collect { it.outputs.files }
+			from zipTasks.collect {
+				it.outputs.files
+			}
 		}
 	}
 

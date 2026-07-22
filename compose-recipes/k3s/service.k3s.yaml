@@ -1,94 +1,4 @@
 services:
-    # Full single-node k3s (kubelet ON) — replaces the old headless-k3s + podman
-    # + kopf operator. Uses the rancher/k3s NATIVE entrypoint (it does the
-    # cgroup-v2 + /run setup the kubelet needs in docker); do NOT wrap it in s6.
-    k3s:
-        image: rancher/k3s:v1.35.0-k3s1
-        container_name: ${NAMESPACE}-k3s
-        command:
-            - server
-            - --flannel-backend=host-gw       # single-node: no vxlan tunnel setup
-            # Lean/fast: k3s's built-in traefik (HelmChart + helm-controller + servicelb)
-            # is slow to reconcile, so we disable it and deploy a minimal traefik
-            # ourselves (see compose-recipes/k3s/traefik.yaml + the deployIngress task).
-            - --disable=traefik
-            - --disable=servicelb
-            - --disable=metrics-server
-            - --disable=local-storage
-            - --disable-helm-controller
-            - --disable-network-policy
-            # Quiet the compose log stream: send k3s's (very chatty) component logs
-            # to a file instead of stdout. Read on demand:
-            #   docker exec ${NAMESPACE}-k3s cat /var/lib/rancher/k3s/k3s.log
-            - --log=/var/lib/rancher/k3s/k3s.log
-            # NOTE: logging-format=json is NOT supported by k3s's embedded components
-            # ("Unsupported log format: json" -> k3s won't start). k3s's build doesn't
-            # register the JSON log format. So we can only redirect to a file (above),
-            # not structure the logs. (This gap is the motivation for the upstream
-            # k3s structured-logging contribution in BUILD-DX-TOOL-BRIEF.md.)
-        healthcheck:
-            interval: 5s
-            retries: 10
-            start_period: 10s
-            test:
-                -   "CMD-SHELL"
-                -   "kubectl get --raw /readyz || exit 1"
-            timeout: 5s
-        networks:
-            default:
-                # CX registrations point Liferay at http://k3s:<nodePort>, so the
-                # k3s container must be reachable as "k3s" from sibling services.
-                aliases:
-                    -   k3s
-        # Publish traefik's :80 so the browser reaches CX at
-        # http://<sid>.<vid>.localtest.me (localtest.me -> 127.0.0.1 -> here).
-        # Fixed :80 collides across parallel workspaces, so run one ingress-enabled
-        # workspace at a time (or override the host side via INGRESS_HTTP_PORT).
-        # The API (6443) stays unpublished on purpose.
-        ports:
-            -   "${INGRESS_HTTP_PORT:-80}:80"
-        privileged: true                       # kubelet/containerd need it (as podman did)
-        tmpfs:                                  # k3s needs writable /run
-            -   /run
-            -   /var/run
-        volumes:
-            # warm datastore + containerd image store persist across restarts
-            -   k3s-data:/var/lib/rancher/k3s
-
-    # One-shot: point CoreDNS at docker's embedded DNS so pods resolve compose
-    # service names (liferay, ...). Runs on the host docker (image already local),
-    # shares the k3s netns to reach the API via the admin kubeconfig, then exits.
-    k3s-dns-forwarder:
-        image: rancher/k3s:v1.35.0-k3s1
-        container_name: ${NAMESPACE}-k3s-dns-forwarder
-        depends_on:
-            k3s:
-                condition: service_healthy
-        entrypoint: ["/bin/sh", "/forwarder.sh"]
-        network_mode: "service:k3s"
-        restart: "no"
-        volumes:
-            -   k3s-data:/var/lib/rancher/k3s
-            -   ./compose-recipes/k3s/forwarder.sh:/forwarder.sh:ro
-
-    # Unauthenticated kubectl proxy on :8001 — this is what Liferay's
-    # PortalK8sAgent talks to (apiServerHost=k3s, apiServerPort=8001, no token).
-    # Shares the k3s netns so :8001 is reachable at k3s:8001 from Liferay.
-    k3s-proxy:
-        image: rancher/k3s:v1.35.0-k3s1
-        container_name: ${NAMESPACE}-k3s-proxy
-        depends_on:
-            k3s:
-                condition: service_healthy
-        entrypoint:
-            -   "/bin/sh"
-            -   "-c"
-            -   "exec kubectl proxy --kubeconfig=/var/lib/rancher/k3s/server/cred/admin.kubeconfig --port=8001 --address=0.0.0.0 --accept-hosts='.*'"
-        network_mode: "service:k3s"
-        restart: unless-stopped
-        volumes:
-            -   k3s-data:/var/lib/rancher/k3s
-
     # Streams CX pod logs to stdout so `lec start` (docker compose logs -f)
     # interleaves them with Liferay. stern auto-discovers pods by label,
     # including new deploys and Job retries. stern is baked into a tiny image
@@ -112,10 +22,96 @@ services:
             -   "10"
             -   "--color"
             -   "always"
-        network_mode: "service:k3s"
+        network_mode: service:k3s
         restart: unless-stopped
         volumes:
             -   k3s-data:/var/lib/rancher/k3s
-
+    # Full single-node k3s (kubelet ON) — replaces the old headless-k3s + podman
+    # + kopf operator. Uses the rancher/k3s NATIVE entrypoint (it does the
+    # cgroup-v2 + /run setup the kubelet needs in docker); do NOT wrap it in s6.
+    k3s:
+        command:
+            -   server
+            -   --flannel-backend=host-gw       # single-node: no vxlan tunnel setup
+            # Lean/fast: k3s's built-in traefik (HelmChart + helm-controller + servicelb)
+            # is slow to reconcile, so we disable it and deploy a minimal traefik
+            # ourselves (see compose-recipes/k3s/traefik.yaml + the deployIngress task).
+            -   --disable=traefik
+            -   --disable=servicelb
+            -   --disable=metrics-server
+            -   --disable=local-storage
+            -   --disable-helm-controller
+            -   --disable-network-policy
+            # Quiet the compose log stream: send k3s's (very chatty) component logs
+            # to a file instead of stdout. Read on demand:
+            #   docker exec ${NAMESPACE}-k3s cat /var/lib/rancher/k3s/k3s.log
+            -   --log=/var/lib/rancher/k3s/k3s.log
+            # NOTE: logging-format=json is NOT supported by k3s's embedded components
+            # ("Unsupported log format: json" -> k3s won't start). k3s's build doesn't
+            # register the JSON log format. So we can only redirect to a file (above),
+            # not structure the logs. (This gap is the motivation for the upstream
+            # k3s structured-logging contribution in BUILD-DX-TOOL-BRIEF.md.)
+        container_name: ${NAMESPACE}-k3s
+        healthcheck:
+            interval: 5s
+            retries: 10
+            start_period: 10s
+            test:
+                -   "CMD-SHELL"
+                -   "kubectl get --raw /readyz || exit 1"
+            timeout: 5s
+        image: rancher/k3s:v1.35.0-k3s1
+        networks:
+            default:
+                # CX registrations point Liferay at http://k3s:<nodePort>, so the
+                # k3s container must be reachable as "k3s" from sibling services.
+                aliases:
+                    -   k3s
+        # Publish traefik's :80 so the browser reaches CX at
+        # http://<sid>.<vid>.localtest.me (localtest.me -> 127.0.0.1 -> here).
+        # Fixed :80 collides across parallel workspaces, so run one ingress-enabled
+        # workspace at a time (or override the host side via INGRESS_HTTP_PORT).
+        # The API (6443) stays unpublished on purpose.
+        ports:
+            -   "${INGRESS_HTTP_PORT:-80}:80"
+        privileged: true                       # kubelet/containerd need it (as podman did)
+        tmpfs:                                  # k3s needs writable /run
+            -   /run
+            -   /var/run
+        volumes:
+            # warm datastore + containerd image store persist across restarts
+            -   k3s-data:/var/lib/rancher/k3s
+    # One-shot: point CoreDNS at docker's embedded DNS so pods resolve compose
+    # service names (liferay, ...). Runs on the host docker (image already local),
+    # shares the k3s netns to reach the API via the admin kubeconfig, then exits.
+    k3s-dns-forwarder:
+        container_name: ${NAMESPACE}-k3s-dns-forwarder
+        depends_on:
+            k3s:
+                condition: service_healthy
+        entrypoint: ["/bin/sh", "/forwarder.sh"]
+        image: rancher/k3s:v1.35.0-k3s1
+        network_mode: service:k3s
+        restart: "no"
+        volumes:
+            -   k3s-data:/var/lib/rancher/k3s
+            -   ./compose-recipes/k3s/forwarder.sh:/forwarder.sh:ro
+    # Unauthenticated kubectl proxy on :8001 — this is what Liferay's
+    # PortalK8sAgent talks to (apiServerHost=k3s, apiServerPort=8001, no token).
+    # Shares the k3s netns so :8001 is reachable at k3s:8001 from Liferay.
+    k3s-proxy:
+        container_name: ${NAMESPACE}-k3s-proxy
+        depends_on:
+            k3s:
+                condition: service_healthy
+        entrypoint:
+            -   "/bin/sh"
+            -   "-c"
+            -   "exec kubectl proxy --kubeconfig=/var/lib/rancher/k3s/server/cred/admin.kubeconfig --port=8001 --address=0.0.0.0 --accept-hosts='.*'"
+        image: rancher/k3s:v1.35.0-k3s1
+        network_mode: service:k3s
+        restart: unless-stopped
+        volumes:
+            -   k3s-data:/var/lib/rancher/k3s
 volumes:
     k3s-data:
