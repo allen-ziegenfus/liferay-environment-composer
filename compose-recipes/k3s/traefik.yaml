@@ -12,7 +12,10 @@ kind: ClusterRole
 metadata: {name: traefik-ingress}
 rules:
     -   apiGroups: [""]
-        resources: [services, endpoints, secrets]
+        # nodes is required: traefik 3.x's kubernetes-ingress provider watches
+        # nodes to resolve endpoints; without it the informer cache never syncs
+        # and no ingress routes are published (every host 404s).
+        resources: [nodes, services, endpoints, secrets]
         verbs: [get, list, watch]
     -   apiGroups: [networking.k8s.io]
         resources: [ingresses, ingressclasses]
@@ -42,6 +45,9 @@ metadata: {name: traefik, namespace: kube-system, labels: {app: traefik}}
 spec:
     replicas: 1
     selector: {matchLabels: {app: traefik}}
+    # hostPort 80 is a node-level singleton, so a rolling update deadlocks (the new
+    # pod can't bind :80 until the old one dies). Recreate kills the old pod first.
+    strategy: {type: Recreate}
     template:
         metadata: {labels: {app: traefik}}
         spec:
