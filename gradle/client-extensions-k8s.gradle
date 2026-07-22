@@ -399,8 +399,24 @@ Map manifestFor(File dir, String name) {
 				key, value ->
 
 				if (value instanceof Map) {
-					if (ingressUrl && value.containsKey("baseURL")) {
-						value.baseURL = ingressUrl
+
+					// objectAction is a server-side webhook: the Liferay backend
+					// calls baseURL + resourcePath. It must use the in-cluster
+					// NodePort (k3s:<nodePort>) -- the browser ingress host
+					// (<sid>.<vid>.localtest.me) resolves to 127.0.0.1 inside the
+					// Liferay container (i.e. Liferay itself), so it is not
+					// reachable server-side. Browser-facing CX (custom elements,
+					// etc.) load from the ingress URL.
+
+					boolean serverSideCallback = value.type == "objectAction"
+
+					if (value.containsKey("baseURL")) {
+						if (serverSideCallback && serviceAddress) {
+							value.baseURL = "http://${serviceAddress}"
+						}
+						else if (ingressUrl) {
+							value.baseURL = ingressUrl
+						}
 					}
 
 					if (ingressUrl && value.containsKey("homePageURL")) {
