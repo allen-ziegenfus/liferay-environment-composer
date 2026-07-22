@@ -35,7 +35,20 @@ For each CX (a directory containing `LCP.json`, or a supplied `*.zip`):
 - **CX → Liferay**: OAuth CX expect the portal at `localhost:80`; a `socat` native
   sidecar bridges `localhost:80 → liferay:8080` (`liferay` resolves inside the
   cluster via the CoreDNS → docker-DNS `forwarder.sh`).
-- **Browser → CX**: `http://<serviceId>.<virtualInstance>.localtest.me` (CORS-correct origin).
+- **Browser → CX**: `http://<serviceId>.<virtualInstance>.localtest.me`.
+
+### Access Liferay at `http://localhost` (not `:8080`) for Client Extensions
+
+traefik also fronts the Liferay portal itself on host `localhost` (via an
+ExternalName Service → the `liferay` compose service). **Open Liferay at
+`http://localhost`**, not `http://localhost:8080`. This matters for CX that make
+CORS requests (custom elements, etc.): a CX's static server (Caddy) uses the
+domains the `PortalK8sAgent` advertises (`com.liferay.lxc.dxp.domains`) as its
+CORS allow-list, and the agent advertises the bare virtual host `localhost`
+(no port — it has no port awareness). Serving Liferay through traefik on `:80`
+makes the browser's origin exactly `http://localhost`, which matches. Reaching
+Liferay on `:8080` would make the origin `http://localhost:8080` and CX CORS
+would fail. (`:8080` stays published for direct/admin access.)
 
 ## PortalK8sAgent
 
