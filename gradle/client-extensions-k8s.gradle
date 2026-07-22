@@ -172,11 +172,17 @@ Map manifestFor(File dir, String name) {
 
 	String image = "lxc/${sid}:latest"
 
-	boolean isJob = (lcp.kind ?: "Deployment").toString().equalsIgnoreCase("job")
+	String kind = (lcp.kind ?: "Deployment").toString()
+
+	boolean isCronJob = kind.equalsIgnoreCase("cronjob")
+	boolean isDeployment = kind.equalsIgnoreCase("deployment")
+	boolean isJob = kind.equalsIgnoreCase("job")
 
 	def port = lcp.loadBalancer?.targetPort
 
-	boolean hasService = (port && !isJob) as boolean
+	// Only Deployments serve traffic; Jobs/CronJobs run and exit.
+
+	boolean hasService = (port && isDeployment) as boolean
 
 	String ingressHost = hasService ? "${sid}.${vid}.localtest.me" : null
 	String ingressUrl = ingressHost ? "http://${ingressHost}" : null
@@ -300,7 +306,26 @@ Map manifestFor(File dir, String name) {
 
 		List items = []
 
-		if (isJob) {
+		if (isCronJob) {
+			podSpec.restartPolicy = "Never"
+
+			items << [
+				apiVersion: "batch/v1",
+				kind: "CronJob",
+				metadata: baseMeta([annotations: annotations, name: sid]),
+				spec: [
+					concurrencyPolicy: (lcp.concurrencyPolicy ?: "Forbid"),
+					jobTemplate: [
+						spec: [
+							backoffLimit: 6,
+							template: [metadata: [labels: [(managedLabel): "true"] + selector], spec: podSpec]
+						]
+					],
+					schedule: lcp.schedule
+				]
+			]
+		}
+		else if (isJob) {
 			podSpec.restartPolicy = "Never"
 
 			items << [
@@ -414,6 +439,7 @@ Map manifestFor(File dir, String name) {
 		hasService: hasService,
 		image: image,
 		ingressUrl: ingressUrl,
+		isCronJob: isCronJob,
 		isJob: isJob,
 		needsLiferay: needsLiferay,
 		restFor: restFor,
@@ -482,18 +508,23 @@ ext.deployOneCx = {
 	}
 
 	// Phase 2: workload + Ingress + ext-provision ConfigMap (with the resolved
-	// address). The :latest tag means apply won't roll, so Jobs delete+recreate
-	// and Deployments rollout restart.
+	// address). The :latest tag means apply won't roll, so Jobs/CronJobs
+	// delete+recreate and Deployments rollout restart.
 
 	if (manifest.isJob) {
 		exec {
 			commandLine "docker", "exec", k3s, "kubectl", "delete", "job", manifest.sid, "--ignore-not-found"
 		}
 	}
+	else if (manifest.isCronJob) {
+		exec {
+			commandLine "docker", "exec", k3s, "kubectl", "delete", "cronjob", manifest.sid, "--ignore-not-found"
+		}
+	}
 
 	kubectlApply(manifest.restFor(nodePort))
 
-	if (!manifest.isJob) {
+	if (!manifest.isJob && !manifest.isCronJob) {
 		exec {
 			commandLine "docker", "exec", k3s, "kubectl", "rollout", "restart", "deployment/${manifest.sid}"
 			ignoreExitValue = true
