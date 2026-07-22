@@ -1,0 +1,59 @@
+# Minimal traefik ingress controller, deployed DIRECTLY (not via k3s's built-in
+# HelmChart/helm-controller/servicelb, which are slow to reconcile). A plain
+# Deployment with hostPort 80 on the node (= the k3s container, whose :80 we
+# publish to the host), watching k8s Ingress resources. Image is pre-imported by
+# the deployIngress task so the pod never has to pull.
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: traefik, namespace: kube-system }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: traefik-ingress }
+rules:
+  - apiGroups: [""]
+    resources: [services, endpoints, secrets]
+    verbs: [get, list, watch]
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses, ingressclasses]
+    verbs: [get, list, watch]
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses/status]
+    verbs: [update]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: { name: traefik-ingress }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: traefik-ingress }
+subjects:
+  - { kind: ServiceAccount, name: traefik, namespace: kube-system }
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata: { name: traefik }
+spec: { controller: traefik.io/ingress-controller }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: traefik, namespace: kube-system, labels: { app: traefik } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: traefik } }
+  template:
+    metadata: { labels: { app: traefik } }
+    spec:
+      serviceAccountName: traefik
+      containers:
+        - name: traefik
+          image: traefik:v3.1
+          imagePullPolicy: IfNotPresent
+          args:
+            - --entrypoints.web.address=:80
+            - --providers.kubernetesingress=true
+            - --providers.kubernetesingress.ingressclass=traefik
+            - --log.level=INFO
+          ports:
+            - { name: web, containerPort: 80, hostPort: 80 }
