@@ -29,26 +29,63 @@ For each CX (a directory containing `LCP.json`, or a supplied `*.zip`):
 - serving CX also get a Traefik **Ingress** at `<serviceId>.<virtualInstance>.localtest.me`,
 - an **ext-provision** ConfigMap is written — the registration `PortalK8sAgent` reads.
 
-## Networking
+## Network paths
 
-- **Liferay → CX**: via the auto-assigned NodePort (`k3s:<nodePort>`).
-- **CX → Liferay**: OAuth CX expect the portal at `localhost:80`; a `socat` native
-  sidecar bridges `localhost:80 → liferay:8080` (`liferay` resolves inside the
-  cluster via the CoreDNS → docker-DNS `forwarder.sh`).
-- **Browser → CX**: `http://<serviceId>.<virtualInstance>.localtest.me`.
+The environment spans two networks — the Docker Compose network (Liferay, the
+database, the `k3s` container) and the in-cluster pod network — so four distinct
+paths are wired up. All browser traffic and all CX ingress share the `k3s`
+container's published `:80` (traefik); Liferay's `:8080` is also published for
+direct/admin access.
 
-### Access Liferay at `http://localhost` (not `:8080`) for Client Extensions
+```
+[4] browser ── http://localhost ─────────────────▶ traefik :80 ──▶ liferay (ExternalName svc) ──▶ liferay:8080
+[3] browser ── http://<sid>.<vid>.localtest.me ──▶ traefik :80 ──▶ CX Service ──▶ CX pod
+[1] liferay ── http://k3s:<nodePort> ────────────▶ CX Service (NodePort) ──▶ CX pod
+[2] CX pod  ── http://localhost:80 ──(socat)─────▶ liferay:8080
+```
 
-traefik also fronts the Liferay portal itself on host `localhost` (via an
-ExternalName Service → the `liferay` compose service). **Open Liferay at
-`http://localhost`**, not `http://localhost:8080`. This matters for CX that make
-CORS requests (custom elements, etc.): a CX's static server (Caddy) uses the
-domains the `PortalK8sAgent` advertises (`com.liferay.lxc.dxp.domains`) as its
-CORS allow-list, and the agent advertises the bare virtual host `localhost`
-(no port — it has no port awareness). Serving Liferay through traefik on `:80`
-makes the browser's origin exactly `http://localhost`, which matches. Reaching
-Liferay on `:8080` would make the origin `http://localhost:8080` and CX CORS
-would fail. (`:8080` stays published for direct/admin access.)
+**[1] Liferay → CX** — server-side webhooks (object actions). Liferay's backend
+calls the CX at its NodePort, reachable on the Docker network via the `k3s` alias
+(`http://k3s:<nodePort>`, which is the CX's `.serviceAddress`). This is **not** the
+ingress URL: `…localtest.me` resolves to `127.0.0.1`, which inside the Liferay
+container is Liferay itself, and a `baseURL` cannot carry a `Host` header for
+traefik to route on. Server-side calls have no CORS/browser concern, so the direct
+NodePort is correct.
+
+**[2] CX → Liferay** — server-side calls from a CX pod (OAuth token requests,
+headless API calls). The `dxp-metadata` advertises the portal at `localhost` over
+`http` (port 80), so CX call `localhost:80`. A `socat` **native sidecar**
+(an initContainer with `restartPolicy: Always`) in each CX pod bridges
+`localhost:80 → liferay:8080`. `liferay` resolves from inside the cluster because
+`forwarder.sh` points CoreDNS at Docker's embedded DNS. It is a native sidecar so
+it does not block `Job`/`CronJob` completion.
+
+**[3] Browser → CX** — a CX's static assets (custom-element bundles, CSS, JS). The
+browser loads them from the CX ingress host
+`http://<serviceId>.<virtualInstance>.localtest.me` (→ `127.0.0.1:80` → traefik →
+CX pod). A browser-facing CX's registered `baseURL` (which its `urls`/`cssURLs`
+resolve against) is this ingress URL.
+
+**[4] Browser → Liferay** — and the CORS link. Liferay is *also* fronted by traefik
+on host `localhost` (an ExternalName Service → the `liferay` compose service).
+**Open Liferay at `http://localhost`, not `http://localhost:8080`.** A CX's static
+server (Caddy) uses the domains the `PortalK8sAgent` advertises
+(`com.liferay.lxc.dxp.domains`) as its CORS allow-list, and the agent advertises
+the bare virtual host `localhost` with **no port** (it has no port awareness).
+Serving Liferay on `:80` via traefik makes the browser's page origin exactly
+`http://localhost`, which matches — so a custom element loaded cross-origin from
+`…localtest.me` passes CORS. Reaching Liferay on `:8080` would make the origin
+`http://localhost:8080` and CX CORS would fail.
+
+### `baseURL` is address-type-aware
+
+Because paths [1] and [3] need different addresses, the plugin rewrites each CX
+config's `baseURL` by type when it renders the ext-provision ConfigMap:
+
+| CX config type | `baseURL` | reached by |
+|---|---|---|
+| `objectAction` (server-side webhook) | `http://k3s:<nodePort>` | Liferay backend — path [1] |
+| everything else (custom element, …) | `http://<sid>.<vid>.localtest.me` | browser — path [3] |
 
 ## PortalK8sAgent
 
