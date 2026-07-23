@@ -104,9 +104,9 @@ caCertData="<cluster CA>"
 saToken="<ServiceAccount token>"
 ```
 
-The config is written into Liferay's hot-deploy folder via `docker exec` (as the
-`liferay` user, straight into the real deploy dir), so there is no shared volume
-to race the image's trial-license population. The k3s server runs with
+The config is written into Liferay's OSGi configs dir (`/opt/liferay/osgi/configs`,
+watched by Felix fileinstall) via `docker exec` — directly, so there is no shared
+volume to race the image's trial-license population. The k3s server runs with
 `--tls-san=k3s` so the API serving cert covers the `k3s` hostname (TLS
 verification succeeds). Nothing static is baked into the workspace — the token +
 CA are generated per cluster at start (`deployAgentCredentials` runs on `start`,

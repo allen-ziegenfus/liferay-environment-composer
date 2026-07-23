@@ -676,10 +676,9 @@ tasks.matching {
 // Give the PortalK8sAgent direct API credentials (the production model, no
 // unauthenticated proxy). Apply the ServiceAccount + RBAC, mint a long-lived
 // token, read the cluster CA, and write the PortalK8sAgentConfiguration into
-// Liferay's hot-deploy folder via docker exec — which runs as the liferay user
-// and writes into the real deploy dir (a symlink to /mnt/liferay/deploy), so
-// there is no shared volume, no populate race, and the trial license is
-// untouched. The agent then reaches the API server directly at k3s:6443.
+// Liferay's OSGi configs dir (Felix fileinstall) via docker exec — writing there
+// directly (no shared volume, no populate race, trial license untouched) so the
+// agent reaches the API server directly at k3s:6443 with the token.
 
 tasks.register("deployAgentCredentials") {
 	description = "Deploy the PortalK8sAgent ServiceAccount credentials + config to Liferay."
@@ -746,7 +745,7 @@ portalK8sConfigurationPropertiesMutators.cardinality.minimum=I"2"
 			name, content ->
 
 			exec {
-				commandLine "docker", "exec", "-i", liferayContainer, "sh", "-c", "cat > /opt/liferay/deploy/${name}"
+				commandLine "docker", "exec", "-i", liferayContainer, "sh", "-c", "cat > /opt/liferay/osgi/configs/${name}"
 				standardInput = new ByteArrayInputStream(content.getBytes("UTF-8"))
 			}
 		}
