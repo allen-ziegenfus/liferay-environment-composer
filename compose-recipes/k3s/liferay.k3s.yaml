@@ -3,7 +3,3 @@ services:
         depends_on:
             k3s:
                 condition: service_healthy
-        # The k3s-agent-credentials oneshot drops the PortalK8sAgent config here
-        # (shared volume) for Liferay to hot-deploy at runtime.
-        volumes:
-            -   liferay-deploy:/opt/liferay/deploy

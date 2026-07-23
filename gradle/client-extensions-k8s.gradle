@@ -673,6 +673,88 @@ tasks.matching {
 	it.dependsOn "deployIngress"
 }
 
+// Give the PortalK8sAgent direct API credentials (the production model, no
+// unauthenticated proxy). Apply the ServiceAccount + RBAC, mint a long-lived
+// token, read the cluster CA, and write the PortalK8sAgentConfiguration into
+// Liferay's hot-deploy folder via docker exec — which runs as the liferay user
+// and writes into the real deploy dir (a symlink to /mnt/liferay/deploy), so
+// there is no shared volume, no populate race, and the trial license is
+// untouched. The agent then reaches the API server directly at k3s:6443.
+
+tasks.register("deployAgentCredentials") {
+	description = "Deploy the PortalK8sAgent ServiceAccount credentials + config to Liferay."
+	group = "liferay k8s"
+
+	doLast {
+		kubectlApply(file("compose-recipes/k3s/agent-rbac.yaml").text)
+
+		String token = ""
+
+		for (int i = 0; i < 30; i++) {
+			ByteArrayOutputStream tokenOut = new ByteArrayOutputStream()
+
+			exec {
+				commandLine "docker", "exec", k3s, "kubectl", "get", "secret", "liferay-portal-k8s-agent-token", "-n", "default", "-o", "jsonpath={.data.token}"
+				ignoreExitValue = true
+				standardOutput = tokenOut
+			}
+
+			token = tokenOut.toString().trim()
+
+			if (token) {
+				break
+			}
+
+			Thread.sleep(2000)
+		}
+
+		if (!token) {
+			throw new GradleException("timed out waiting for the ServiceAccount token")
+		}
+
+		ByteArrayOutputStream caCertOutputStream = new ByteArrayOutputStream()
+
+		exec {
+			commandLine "docker", "exec", k3s, "kubectl", "get", "secret", "liferay-portal-k8s-agent-token", "-n", "default", "-o", "jsonpath={.data.ca\\.crt}"
+			standardOutput = caCertOutputStream
+		}
+
+		String caCertData = caCertOutputStream.toString().trim()
+		String saToken = new String(token.decodeBase64())
+
+		Map<String, String> configFiles = [
+			"com.liferay.portal.k8s.agent.configuration.PortalK8sAgentConfiguration.config": """\
+active="true"
+apiServerHost="k3s"
+apiServerPort="6443"
+apiServerSSL="true"
+caCertData="${caCertData}"
+enabled="true"
+namespace="default"
+saToken="${saToken}"
+portalK8sConfigurationPropertiesMutators.cardinality.minimum=I"2"
+""",
+
+			// Disable the BaseURL mutator's company lookup so it does not overwrite
+			// the baseURL the plugin sets (ingress for browser CX, NodePort for
+			// objectAction). This leaves the Annotations + Labels mutators,
+			// satisfying cardinality.minimum=2.
+			"com.liferay.portal.k8s.agent.internal.mutator.BaseURLPortalK8sConfigurationPropertiesMutator.config": "_companyLocalService.target=\"(service.vendor=this.is.the.only.way.to.disable.this.component.i.could.find)\"\n"
+		]
+
+		configFiles.each {
+			name, content ->
+
+			exec {
+				commandLine "docker", "exec", "-i", liferayContainer, "sh", "-c", "cat > /opt/liferay/deploy/${name}"
+				standardInput = new ByteArrayInputStream(content.getBytes("UTF-8"))
+			}
+		}
+
+		logger.lifecycle("PortalK8sAgent credentials deployed to Liferay (direct API access at k3s:6443)")
+	}
+}
+
 // Connect to the cluster from the host: writes a kubeconfig pointing at the k3s
 // container's IP (reachable directly on Linux; the k3s serving cert already
 // lists that IP). Re-run after a restart (the container IP can change).

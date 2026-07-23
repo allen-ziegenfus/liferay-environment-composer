@@ -91,10 +91,10 @@ config's `baseURL` by type when it renders the ext-provision ConfigMap:
 
 The agent talks to the k3s API server **directly with a ServiceAccount bearer
 token** — the same model as production Liferay Cloud (no unauthenticated proxy).
-The `k3s-agent-credentials` one-shot applies `agent-rbac.yaml` (a ServiceAccount
-+ Role scoped to `configmaps` — modeled on cloud's `liferay-dxp-agent`
-ClusterRole — + a long-lived token Secret), then hot-deploys the generated
-config into Liferay's `/opt/liferay/deploy` (a shared volume):
+The `deployAgentCredentials` Gradle task applies `agent-rbac.yaml` (a
+ServiceAccount + Role scoped to `configmaps` — modeled on cloud's
+`liferay-dxp-agent` ClusterRole — + a long-lived token Secret), mints the token,
+reads the cluster CA, and writes the config:
 
 ```properties
 apiServerHost="k3s"
@@ -104,9 +104,13 @@ caCertData="<cluster CA>"
 saToken="<ServiceAccount token>"
 ```
 
-The k3s server runs with `--tls-san=k3s` so the API serving cert covers the
-`k3s` hostname (TLS verification succeeds). Nothing static is baked into the
-workspace — the token + CA are generated per cluster at start.
+The config is written into Liferay's hot-deploy folder via `docker exec` (as the
+`liferay` user, straight into the real deploy dir), so there is no shared volume
+to race the image's trial-license population. The k3s server runs with
+`--tls-san=k3s` so the API serving cert covers the `k3s` hostname (TLS
+verification succeeds). Nothing static is baked into the workspace — the token +
+CA are generated per cluster at start (`deployAgentCredentials` runs on `start`,
+before CX deploy).
 
 ## Roadmap / TODO
 

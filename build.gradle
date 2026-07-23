@@ -467,9 +467,14 @@ dockerCompose {
 // tasks themselves live in gradle/client-extensions-k8s.gradle.
 if (config.services.contains("k3s")) {
 
-	// docker exec target for the applied script (container_name is ${NAMESPACE}-k3s).
+	// docker exec targets for the applied script (container_name is
+	// ${NAMESPACE}-<service>).
 	if (!project.hasProperty("k3s")) {
 		project.ext.k3s = "${config.namespace}-k3s"
+	}
+
+	if (!project.hasProperty("liferayContainer")) {
+		project.ext.liferayContainer = "${config.namespace}-liferay"
 	}
 
 	apply from: "gradle/client-extensions-k8s.gradle"
@@ -515,6 +520,12 @@ if (config.services.contains("k3s")) {
 
 	tasks.matching { it.name == "deployClientExtensions" }.all {
 		it.dependsOn "stageClientExtensions"
+	}
+
+	// Give the PortalK8sAgent its API credentials before deploying CX (the agent
+	// needs them to read the ext-provision ConfigMaps).
+	tasks.matching { it.name == "deployClientExtensions" }.all {
+		it.dependsOn "deployAgentCredentials"
 	}
 
 	// Manual-only: wipe the k3s stack + its state volume for a clean cluster. NOT
