@@ -264,8 +264,29 @@ tasks.register("stop") {
 
 buildDockerImage {
 	doFirst {
-		waitForCommand("docker pull ${gradle.liferayWorkspace.dockerImageLiferay}", null, System.out)
+		String liferayImage = "${gradle.liferayWorkspace.dockerImageLiferay}"
+
+		try {
+			waitForCommand(
+				"docker pull ${liferayImage}", null, System.out)
+		}
+		catch (Exception exception) {
+			Process inspectProcess =
+			["docker", "image", "inspect", liferayImage].execute()
+
+			inspectProcess.waitFor()
+
+			if (inspectProcess.exitValue() != 0) {
+				throw exception
+			}
+
+			logger.lifecycle(
+				">> [LEC] Could not pull ${liferayImage}; using the " +
+					"locally present image")
+		}
 	}
+
+	pull = false
 
 	onlyIf("using the Liferay service") {
 		config.useLiferay
