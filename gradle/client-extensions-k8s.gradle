@@ -437,6 +437,15 @@ Map manifestFor(File dir, String name) {
 					if (serviceAddress && value.containsKey(".serviceAddress")) {
 						value[".serviceAddress"] = serviceAddress
 					}
+
+					// Keep the CX's self-declared virtual instance in step with the
+					// vid resolved for this deploy, so a multi-tenant override
+					// (virtual-instances.properties / -PvirtualInstance*) registers
+					// under the intended instance rather than the archive's baked-in
+					// "default".
+					if (value.containsKey("dxp.lxc.liferay.com.virtualInstanceId")) {
+						value["dxp.lxc.liferay.com.virtualInstanceId"] = vid
+					}
 				}
 			}
 
