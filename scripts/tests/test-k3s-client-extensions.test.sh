@@ -52,4 +52,11 @@ teardown() {
 	# to the in-cluster NodePort, while browser-facing CX use the ingress host.
 	assert_output --partial 'http://k3s:'
 	assert_output --partial '.localtest.me'
+
+	# homePageURL is consumed server-side (OAuth app audience + the address the
+	# object-action catapult posts to), so it must resolve to the NodePort, never
+	# the browser ingress host. (It is rendered inside the ext-provision ConfigMap
+	# as escaped JSON, hence the loose match around the key.)
+	assert_output --regexp 'homePageURL.{2,6}http://k3s:'
+	refute_output --regexp 'homePageURL.{2,6}http://cxoauthaction'
 }

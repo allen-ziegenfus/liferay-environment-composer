@@ -419,8 +419,19 @@ Map manifestFor(File dir, String name) {
 						}
 					}
 
-					if (ingressUrl && value.containsKey("homePageURL")) {
-						value.homePageURL = ingressUrl
+					// homePageURL is the CX's own service endpoint. It is consumed
+					// SERVER-SIDE: it becomes the OAuth application's audience and
+					// the address PortalCatapultImpl posts object-action webhooks to.
+					// It must therefore be the in-cluster NodePort, not the browser
+					// ingress host (…localtest.me resolves to 127.0.0.1, which inside
+					// the Liferay container is Liferay itself).
+					if (value.containsKey("homePageURL")) {
+						if (serviceAddress) {
+							value.homePageURL = "http://${serviceAddress}"
+						}
+						else if (ingressUrl) {
+							value.homePageURL = ingressUrl
+						}
 					}
 
 					if (serviceAddress && value.containsKey(".serviceAddress")) {
