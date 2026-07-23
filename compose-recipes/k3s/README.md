@@ -89,14 +89,33 @@ config's `baseURL` by type when it renders the ext-provision ConfigMap:
 
 ## PortalK8sAgent
 
-The recipe exposes an unauthenticated `kubectl proxy` at `k3s:8001`. Point the agent
-at it in the workspace's OSGi config
-(`com.liferay.portal.k8s.agent.configuration.PortalK8sAgentConfiguration.config`):
+The agent talks to the k3s API server **directly with a ServiceAccount bearer
+token** — the same model as production Liferay Cloud (no unauthenticated proxy).
+The `k3s-agent-credentials` one-shot applies `agent-rbac.yaml` (a ServiceAccount
++ Role scoped to `configmaps` — modeled on cloud's `liferay-dxp-agent`
+ClusterRole — + a long-lived token Secret), then hot-deploys the generated
+config into Liferay's `/opt/liferay/deploy` (a shared volume):
 
 ```properties
 apiServerHost="k3s"
-apiServerPort="8001"
+apiServerPort="6443"
+apiServerSSL="true"
+caCertData="<cluster CA>"
+saToken="<ServiceAccount token>"
 ```
+
+The k3s server runs with `--tls-san=k3s` so the API serving cert covers the
+`k3s` hostname (TLS verification succeeds). Nothing static is baked into the
+workspace — the token + CA are generated per cluster at start.
+
+## Roadmap / TODO
+
+- **PaaS (CRD) mode.** Today the agent uses the ConfigMap contract (the DXP
+  agent is ConfigMap-based). Liferay Cloud's PaaS pipeline instead uses the
+  `k8s.liferay.com` CRDs (`LiferayExtensionProvision` / `Init` /
+  `VirtualInstance`). Emulating that would mean installing those CRDs + a small
+  controller to materialize CRs into the ConfigMaps the agent reads — deferred
+  as a larger, separate piece.
 
 ## Tailing CX logs
 

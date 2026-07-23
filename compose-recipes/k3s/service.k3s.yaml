@@ -32,6 +32,9 @@ services:
     k3s:
         command:
             -   server
+            # Include the "k3s" hostname in the API serving cert so the
+            # PortalK8sAgent can verify TLS when connecting to k3s:6443.
+            -   --tls-san=k3s
             -   --flannel-backend=host-gw       # single-node: no vxlan tunnel setup
             # Lean/fast: k3s's built-in traefik (HelmChart + helm-controller + servicelb)
             # is slow to reconcile, so we disable it and deploy a minimal traefik
@@ -81,6 +84,25 @@ services:
         volumes:
             # warm datastore + containerd image store persist across restarts
             -   k3s-data:/var/lib/rancher/k3s
+    # One-shot: give the PortalK8sAgent real API credentials (ServiceAccount +
+    # RBAC + bearer token) and hot-deploy its config to Liferay, so the agent
+    # talks to the API server directly at k3s:6443 with a token — no
+    # unauthenticated proxy process to crash. See agent-credentials.sh +
+    # agent-rbac.yaml.
+    k3s-agent-credentials:
+        container_name: ${NAMESPACE}-k3s-agent-credentials
+        depends_on:
+            k3s:
+                condition: service_healthy
+        entrypoint: ["/bin/sh", "/agent-credentials.sh"]
+        image: rancher/k3s:v1.35.0-k3s1
+        network_mode: service:k3s
+        restart: "no"
+        volumes:
+            -   k3s-data:/var/lib/rancher/k3s
+            -   ./compose-recipes/k3s/agent-credentials.sh:/agent-credentials.sh:ro
+            -   ./compose-recipes/k3s/agent-rbac.yaml:/agent-rbac.yaml:ro
+            -   liferay-deploy:/liferay-deploy
     # One-shot: point CoreDNS at docker's embedded DNS so pods resolve compose
     # service names (liferay, ...). Runs on the host docker (image already local),
     # shares the k3s netns to reach the API via the admin kubeconfig, then exits.
@@ -96,22 +118,8 @@ services:
         volumes:
             -   k3s-data:/var/lib/rancher/k3s
             -   ./compose-recipes/k3s/forwarder.sh:/forwarder.sh:ro
-    # Unauthenticated kubectl proxy on :8001 — this is what Liferay's
-    # PortalK8sAgent talks to (apiServerHost=k3s, apiServerPort=8001, no token).
-    # Shares the k3s netns so :8001 is reachable at k3s:8001 from Liferay.
-    k3s-proxy:
-        container_name: ${NAMESPACE}-k3s-proxy
-        depends_on:
-            k3s:
-                condition: service_healthy
-        entrypoint:
-            -   "/bin/sh"
-            -   "-c"
-            -   "exec kubectl proxy --kubeconfig=/var/lib/rancher/k3s/server/cred/admin.kubeconfig --port=8001 --address=0.0.0.0 --accept-hosts='.*'"
-        image: rancher/k3s:v1.35.0-k3s1
-        network_mode: service:k3s
-        restart: unless-stopped
-        volumes:
-            -   k3s-data:/var/lib/rancher/k3s
 volumes:
     k3s-data:
+    # Shared with the liferay service (mounted at /opt/liferay/deploy) so the
+    # credentials oneshot can hot-deploy the agent config.
+    liferay-deploy:
