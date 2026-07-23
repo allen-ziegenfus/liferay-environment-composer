@@ -20,14 +20,54 @@ Client Extension found under `client-extensions/` (see the **Liferay k8s** Gradl
 task group). Nothing else in the workspace changes when k3s is disabled — the whole
 integration is guarded by the service flag.
 
+## Supplying Client Extensions
+
+CX are discovered **recursively** under `client-extensions/`, in either input form:
+
+| Input form | What it is | How it is handled |
+|---|---|---|
+| `*.zip` | a built CX artifact — the usual LEC input (e.g. the `dist/*.zip` a `liferay-portal` workspace produces) | unpacked into `build/cx/<name>/`, then imaged |
+| a directory with `LCP.json` at its root | an unpacked or hand-authored CX (`LCP.json` + `Dockerfile` + assets + `*.client-extension-config.json`) | imaged in place |
+
+Both forms converge on the same thing — a directory with an `LCP.json` — so a zip
+and its unpacked equivalent deploy identically. **Subfolders are organizational
+only** (group by vendor, team, etc.); they do *not* set the virtual instance (see
+[Multiple virtual instances](#multiple-virtual-instances)). You can mix zips and
+directories, at any depth:
+
+```
+client-extensions/
+  liferay.com/
+    liferay-sample-custom-element-1.zip   # a built artifact
+    liferay-sample-batch.zip
+  my-service/                             # an unpacked / source CX
+    LCP.json
+    Dockerfile
+    ...
+```
+
+To build the official samples and stage them, for example:
+
+```bash
+(cd liferay-sample-workspace && ./gradlew build)
+cp liferay-sample-workspace/client-extensions/*/dist/*.zip \
+	my-lec-workspace/client-extensions/liferay.com/
+```
+
 ## What it deploys
 
-For each CX (a directory containing `LCP.json`, or a supplied `*.zip`):
+For each CX an image is built and imported into the cluster's containerd, then a
+workload is applied per its `LCP.json` `kind` (and whether it serves a port):
 
-- an image is built and imported into the cluster's containerd,
-- a **Deployment** (or **Job**, per `LCP.json` `kind`) + **Service** (NodePort) are applied,
-- serving CX also get a Traefik **Ingress** at `<serviceId>.<virtualInstance>.localtest.me`,
-- an **ext-provision** ConfigMap is written — the registration `PortalK8sAgent` reads.
+| CX kind (`LCP.json`) | k8s workload | extras |
+|---|---|---|
+| `Deployment` **with a port** (custom element, CSS/JS, theme, static assets, config servers) | **Deployment** + **Service** (NodePort) | a Traefik **Ingress** at `<sid>.<vid>.localtest.me`; a **socat** native sidecar if the CX calls Liferay over OAuth |
+| `Deployment` without a port | **Deployment** | — |
+| `Job` (batch, site initializer) | **Job** | — |
+| `CronJob` (with a `schedule`) | **CronJob** | runs on the schedule |
+
+Every CX — serving, batch, cron, or config-only — also gets an **ext-provision**
+ConfigMap: the registration the `PortalK8sAgent` reads to surface the CX in Liferay.
 
 ## Network paths
 
@@ -86,6 +126,36 @@ config's `baseURL` by type when it renders the ext-provision ConfigMap:
 |---|---|---|
 | `objectAction` (server-side webhook) | `http://k3s:<nodePort>` | Liferay backend — path [1] |
 | everything else (custom element, …) | `http://<sid>.<vid>.localtest.me` | browser — path [3] |
+
+## Multiple virtual instances
+
+Each CX is registered against a Liferay **virtual instance**. The resolved vid is
+woven through the CX's manifests — the ingress host (`<sid>.<vid>.localtest.me`),
+the `dxp.lxc.liferay.com/virtualInstanceId` annotation, and the CX's own
+`virtualInstanceId` — so several instances are addressable side by side.
+
+A built archive only carries the placeholder `default`. Override it — per CX or
+workspace-wide — by this precedence (first match wins):
+
+1. `client-extensions/virtual-instances.properties`, with `<name-or-sid> = <vid>`
+   lines (relocate the file with `-PviMapping=<path>`)
+2. `-PvirtualInstance.<name>=<vid>` or `-PvirtualInstance.<sid>=<vid>` (per CX)
+3. `-PvirtualInstanceId=<vid>` (workspace default)
+4. `default`
+
+The `<name>` is the CX's directory/zip name; the `<sid>` is its `LCP.json` `id`.
+For example, to split two CX across instances:
+
+```properties
+# client-extensions/virtual-instances.properties
+liferay-sample-custom-element-1 = acme
+liferay-sample-custom-element-2 = beta
+```
+
+The metadata ConfigMaps the agent reads are named by the instance **webId**
+(`company.getWebId()`), resolved independently: `-PwebId=<id>` >
+`company.default.web.id` in `configs/common/portal-ext.properties` > `liferay.com`.
+The target instance must exist in Liferay for the agent to register the CX there.
 
 ## PortalK8sAgent
 
