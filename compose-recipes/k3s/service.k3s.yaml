@@ -22,6 +22,11 @@ services:
             -   "10"
             -   "--color"
             -   "always"
+            # Kubelet readiness/liveness probes hit every CX pod's HTTP server
+            # every few seconds; with dozens of CX their access logs drown out
+            # everything else. Drop the probe traffic from the tailed stream.
+            -   "--exclude"
+            -   "kube-probe"
         network_mode: service:k3s
         restart: unless-stopped
         volumes:
