@@ -133,7 +133,37 @@ Properties loadViMap() {
 	return properties
 }
 
-String resolveVirtualInstance(String sid, String name) {
+// The vid a packaged CX declares for itself. Per-VI variant artifacts bake it
+// into their config (the tooling emits one variant per instance), so it is a
+// resolution source: such a variant registers under its own instance with no
+// external mapping.
+
+String bakedVirtualInstanceId(File dir) {
+	String found = null
+
+	dir.listFiles(
+		{
+			File file ->
+
+			file.name.endsWith(".client-extension-config.json")
+		} as FileFilter)?.each {
+		File configFile ->
+
+		new JsonSlurper().parse(configFile).values().each {
+			value ->
+
+			if ((value instanceof Map) && !found &&
+				value["dxp.lxc.liferay.com.virtualInstanceId"]) {
+
+				found = value["dxp.lxc.liferay.com.virtualInstanceId"]
+			}
+		}
+	}
+
+	return found
+}
+
+String resolveVirtualInstance(String sid, String name, String bakedVid) {
 	Properties viMap = loadViMap()
 
 	List<String> candidates = [
@@ -141,7 +171,8 @@ String resolveVirtualInstance(String sid, String name) {
 		viMap.getProperty(sid),
 		project.findProperty("virtualInstance.${name}"),
 		project.findProperty("virtualInstance.${sid}"),
-		project.findProperty("virtualInstanceId")
+		project.findProperty("virtualInstanceId"),
+		bakedVid
 	]
 
 	return candidates.find {
@@ -166,9 +197,24 @@ Map manifestFor(File dir, String name) {
 	def lcp = new JsonSlurper().parse(new File(dir, "LCP.json"))
 
 	String sid = lcp.id
-	String vid = resolveVirtualInstance(sid, name)
+	String vid = resolveVirtualInstance(sid, name, bakedVirtualInstanceId(dir))
 
-	// vid-independent: one image, the registration carries the virtual instance.
+	// The same CX can target more than one virtual instance (a per-VI variant
+	// artifact carries its own vid). The LCP.json id (sid) is identical across
+	// variants, so the k8s objects are named by a vid-qualified key to let the
+	// variants coexist in the namespace; the default instance keeps the bare sid
+	// so existing single-instance deploys are byte-for-byte unchanged.
+
+	String vidSlug = vid.toLowerCase(
+	).replaceAll(
+		/[^a-z0-9]+/, "-"
+	).replaceAll(
+		/^-+|-+$/, ""
+	)
+
+	String deployName = (vid == "default") ? sid : "${sid}-${vidSlug}"
+
+	// The image is shared across a CX's instances (same code, same id).
 
 	String image = "lxc/${sid}:latest"
 
@@ -237,7 +283,7 @@ Map manifestFor(File dir, String name) {
 	Map podSpec = [
 		containers: [container],
 		volumes: [
-			[configMap: [name: "${sid}-ext-provision"], name: "ext-provision"],
+			[configMap: [name: "${deployName}-ext-provision"], name: "ext-provision"],
 
 			// dxp + ext-init are created by PortalK8sAgent AFTER registration,
 			// named by the instance webId; mounted optional so the pod starts and
@@ -289,7 +335,7 @@ Map manifestFor(File dir, String name) {
 		serviceJson = JsonOutput.toJson([
 			apiVersion: "v1",
 			kind: "Service",
-			metadata: baseMeta([name: sid]),
+			metadata: baseMeta([name: deployName]),
 			spec: [
 				ports: [[port: port, targetPort: port]],
 				selector: selector,
@@ -312,7 +358,7 @@ Map manifestFor(File dir, String name) {
 			items << [
 				apiVersion: "batch/v1",
 				kind: "CronJob",
-				metadata: baseMeta([annotations: annotations, name: sid]),
+				metadata: baseMeta([annotations: annotations, name: deployName]),
 				spec: [
 					concurrencyPolicy: (lcp.concurrencyPolicy ?: "Forbid"),
 					jobTemplate: [
@@ -331,7 +377,7 @@ Map manifestFor(File dir, String name) {
 			items << [
 				apiVersion: "batch/v1",
 				kind: "Job",
-				metadata: baseMeta([annotations: annotations, name: sid]),
+				metadata: baseMeta([annotations: annotations, name: deployName]),
 				spec: [
 					backoffLimit: 6,
 					template: [metadata: [labels: [(managedLabel): "true"] + selector], spec: podSpec],
@@ -343,7 +389,7 @@ Map manifestFor(File dir, String name) {
 			items << [
 				apiVersion: "apps/v1",
 				kind: "Deployment",
-				metadata: baseMeta([annotations: annotations, name: sid]),
+				metadata: baseMeta([annotations: annotations, name: deployName]),
 				spec: [
 					replicas: (lcp.scale ?: 1),
 					selector: [matchLabels: selector],
@@ -355,7 +401,7 @@ Map manifestFor(File dir, String name) {
 				items << [
 					apiVersion: "networking.k8s.io/v1",
 					kind: "Ingress",
-					metadata: baseMeta([name: sid]),
+					metadata: baseMeta([name: deployName]),
 					spec: [
 						ingressClassName: "traefik",
 						rules: [
@@ -364,7 +410,7 @@ Map manifestFor(File dir, String name) {
 								http: [
 									paths: [
 										[
-											backend: [service: [name: sid, port: [number: port]]],
+											backend: [service: [name: deployName, port: [number: port]]],
 											path: "/",
 											pathType: "Prefix"
 										]
@@ -464,7 +510,7 @@ Map manifestFor(File dir, String name) {
 					"ext.lxc.liferay.com/serviceId": sid,
 					"lxc.liferay.com/metadataType": "ext-provision"
 				],
-				name: "${sid}-ext-provision"
+				name: "${deployName}-ext-provision"
 			]
 		]
 
@@ -472,6 +518,7 @@ Map manifestFor(File dir, String name) {
 	}
 
 	return [
+		deployName: deployName,
 		hasService: hasService,
 		image: image,
 		ingressUrl: ingressUrl,
@@ -536,7 +583,7 @@ ext.deployOneCx = {
 		ByteArrayOutputStream out = new ByteArrayOutputStream()
 
 		exec {
-			commandLine "docker", "exec", k3s, "kubectl", "get", "svc", manifest.sid, "-o", "jsonpath={.spec.ports[0].nodePort}"
+			commandLine "docker", "exec", k3s, "kubectl", "get", "svc", manifest.deployName, "-o", "jsonpath={.spec.ports[0].nodePort}"
 			standardOutput = out
 		}
 
@@ -549,12 +596,12 @@ ext.deployOneCx = {
 
 	if (manifest.isJob) {
 		exec {
-			commandLine "docker", "exec", k3s, "kubectl", "delete", "job", manifest.sid, "--ignore-not-found"
+			commandLine "docker", "exec", k3s, "kubectl", "delete", "job", manifest.deployName, "--ignore-not-found"
 		}
 	}
 	else if (manifest.isCronJob) {
 		exec {
-			commandLine "docker", "exec", k3s, "kubectl", "delete", "cronjob", manifest.sid, "--ignore-not-found"
+			commandLine "docker", "exec", k3s, "kubectl", "delete", "cronjob", manifest.deployName, "--ignore-not-found"
 		}
 	}
 
@@ -562,7 +609,7 @@ ext.deployOneCx = {
 
 	if (!manifest.isJob && !manifest.isCronJob) {
 		exec {
-			commandLine "docker", "exec", k3s, "kubectl", "rollout", "restart", "deployment/${manifest.sid}"
+			commandLine "docker", "exec", k3s, "kubectl", "rollout", "restart", "deployment/${manifest.deployName}"
 			ignoreExitValue = true
 		}
 	}
@@ -637,7 +684,7 @@ tasks.register("renderClientExtensions") {
 
 			Map manifest = manifestFor(dir, name)
 
-			def nodePort = manifest.hasService ? nodePortFor(manifest.sid) : null
+			def nodePort = manifest.hasService ? nodePortFor(manifest.deployName) : null
 
 			println "# ===== ${manifest.vid}/${manifest.sid} image=${manifest.image} ingress=${manifest.ingressUrl} ====="
 

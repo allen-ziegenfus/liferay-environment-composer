@@ -102,3 +102,19 @@ teardown() {
 	assert_output --regexp 'dxp.lxc.liferay.com.virtualInstanceId.{2,6}acme'
 	refute_output --partial '.default.localtest.me'
 }
+
+@test "renderClientExtensions honors a CX's baked-in vid and names objects by sid+vid" {
+	_debug "RUNNING ${BATS_TEST_NAME}"
+
+	run ./gradlew renderClientExtensions --quiet --console=plain
+
+	assert_success
+
+	# The cx-vi-variant fixture bakes virtualInstanceId=acme.local into its config
+	# (a per-VI variant artifact). With no external override, that vid is honored,
+	# and the k8s objects are named by a DNS-safe sid+vid key so the same CX can
+	# coexist across instances (the bare-sid default variant keeps its name).
+	assert_output --partial '"name": "cxvivariant-acme-local"'
+	assert_output --partial 'cxvivariant-acme-local-ext-provision'
+	assert_output --partial 'cxvivariant.acme.local.localtest.me'
+}
