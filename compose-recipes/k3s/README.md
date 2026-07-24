@@ -134,23 +134,41 @@ woven through the CX's manifests — the ingress host (`<sid>.<vid>.localtest.me
 the `dxp.lxc.liferay.com/virtualInstanceId` annotation, and the CX's own
 `virtualInstanceId` — so several instances are addressable side by side.
 
-A built archive only carries the placeholder `default`. Override it — per CX or
-workspace-wide — by this precedence (first match wins):
+The vid is resolved by this precedence (first match wins):
 
 1. `client-extensions/virtual-instances.properties`, with `<name-or-sid> = <vid>`
    lines (relocate the file with `-PviMapping=<path>`)
 2. `-PvirtualInstance.<name>=<vid>` or `-PvirtualInstance.<sid>=<vid>` (per CX)
 3. `-PvirtualInstanceId=<vid>` (workspace default)
-4. `default`
+4. the CX's **baked-in** `dxp.lxc.liferay.com.virtualInstanceId` — per-VI variant
+   artifacts carry it in their config, so such a variant registers under its own
+   instance with no external mapping
+5. `default`
 
 The `<name>` is the CX's directory/zip name; the `<sid>` is its `LCP.json` `id`.
-For example, to split two CX across instances:
+For example, to split two different CX across instances:
 
 ```properties
 # client-extensions/virtual-instances.properties
 liferay-sample-custom-element-1 = acme
 liferay-sample-custom-element-2 = beta
 ```
+
+### The same CX in more than one instance
+
+Because a CX's `LCP.json` `id` (`sid`) is identical across its per-VI variants,
+the k8s objects (Deployment, Service, Job/CronJob, Ingress, ext-provision
+ConfigMap) are named by a DNS-safe **`<sid>-<vid>`** key — e.g.
+`liferaysamplecustomelement1-mytest-local` — so the variants coexist in the
+namespace instead of overwriting each other. The **`default`** instance keeps the
+bare `<sid>`, so single-instance workspaces are unchanged. All variants share one
+image (`lxc/<sid>:latest`); only the registration + ingress host differ by vid.
+
+> This is the single-namespace, DXP-virtual-instance model (what the local
+> `PortalK8sAgent` watches — one namespace). The **namespace-per-instance** layout
+> (a separate namespace/runtime per tenant, ConfigMaps synced by the cloud API) is
+> a Liferay SaaS control-plane concern and is **out of scope** for this local
+> single-node recipe.
 
 The metadata ConfigMaps the agent reads are named by the instance **webId**
 (`company.getWebId()`), resolved independently: `-PwebId=<id>` >
