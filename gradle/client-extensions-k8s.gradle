@@ -275,6 +275,46 @@ Map manifestFor(File dir, String name, File entry) {
 
 	Map<String, String> selector = [app: sid, domain: vid]
 
+	// A CX gets the ext-init metadata mount only when it registers an OAuth2
+	// application (user-agent or headless-server) -- the same rule cloud's
+	// LXCExtensionVolumesContributor applies (its isVolumeMountRequired keys on
+	// the OAuth2Provider*Configuration config prefixes). dxp-metadata is mounted
+	// for every CX. Both are REQUIRED (no "optional"): the agent creates them
+	// AFTER it registers the CX, so the pod waits (ContainerCreating) rather than
+	// starting into an empty mount and crash-looping -- an app like Spring reads
+	// its config once at boot and can't pick up a mount synced in later. A CX with
+	// no OAuth app gets no ext-init (the agent never creates one), so it is left
+	// out entirely rather than mounted and waited on forever.
+
+	boolean needsLiferay = dir.listFiles(
+		{
+			File file ->
+
+			file.name.endsWith(".client-extension-config.json")
+		} as FileFilter)?.any {
+		File configFile ->
+
+		new JsonSlurper().parse(configFile).values().any {
+			it instanceof Map && ((it.type == "oAuthApplicationUserAgent") || (it.type == "oAuthApplicationHeadlessServer"))
+		}
+	} ?: false
+
+	List volumeMounts = [
+		[mountPath: "/etc/liferay/lxc/ext-provision-metadata", name: "ext-provision", readOnly: true],
+		[mountPath: "/etc/liferay/lxc/dxp-metadata", name: "dxp", readOnly: true]
+	]
+
+	List volumes = [
+		[configMap: [name: "${deployName}-ext-provision"], name: "ext-provision"],
+		[configMap: [name: "${webId}-lxc-dxp-metadata"], name: "dxp"]
+	]
+
+	if (needsLiferay) {
+		volumeMounts << [mountPath: "/etc/liferay/lxc/ext-init-metadata", name: "ext-init", readOnly: true]
+
+		volumes << [configMap: [name: "${sid}-${webId}-lxc-ext-init-metadata"], name: "ext-init"]
+	}
+
 	Map container = [
 		env: (extraEnv + (lcp.env ?: [:])).collect {
 			key, value ->
@@ -284,11 +324,7 @@ Map manifestFor(File dir, String name, File entry) {
 		image: image,
 		imagePullPolicy: "IfNotPresent",
 		name: "main",
-		volumeMounts: [
-			[mountPath: "/etc/liferay/lxc/ext-provision-metadata", name: "ext-provision", readOnly: true],
-			[mountPath: "/etc/liferay/lxc/dxp-metadata", name: "dxp", readOnly: true],
-			[mountPath: "/etc/liferay/lxc/ext-init-metadata", name: "ext-init", readOnly: true]
-		]
+		volumeMounts: volumeMounts
 	]
 
 	if (port) {
@@ -305,33 +341,11 @@ Map manifestFor(File dir, String name, File entry) {
 
 	// OAuth CX expect the portal at localhost:80; bridge to liferay:8080 with a
 	// socat sidecar (as the kopf operator did; "liferay" resolves via the
-	// forwarder).
-
-	boolean needsLiferay = dir.listFiles(
-		{
-			File file ->
-
-			file.name.endsWith(".client-extension-config.json")
-		} as FileFilter)?.any {
-		File configFile ->
-
-		new JsonSlurper().parse(configFile).values().any {
-			it instanceof Map && ((it.type == "oAuthApplicationUserAgent") || (it.type == "oAuthApplicationHeadlessServer"))
-		}
-	} ?: false
+	// forwarder). needsLiferay (computed above) is the same OAuth-app signal.
 
 	Map podSpec = [
 		containers: [container],
-		volumes: [
-			[configMap: [name: "${deployName}-ext-provision"], name: "ext-provision"],
-
-			// dxp + ext-init are created by PortalK8sAgent AFTER registration,
-			// named by the instance webId; mounted optional so the pod starts and
-			// the kubelet syncs them in once the agent creates them.
-
-			[configMap: [name: "${webId}-lxc-dxp-metadata", optional: true], name: "dxp"],
-			[configMap: [name: "${sid}-${webId}-lxc-ext-init-metadata", optional: true], name: "ext-init"]
-		]
+		volumes: volumes
 	]
 
 	// socat bridge as a NATIVE sidecar (initContainer + restartPolicy: Always):
