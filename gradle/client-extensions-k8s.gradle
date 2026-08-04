@@ -193,11 +193,51 @@ int nodePortFor(String sid) {
 // is rendered. Serving CX also get an Ingress on <sid>.<vid>.localtest.me so a
 // browser can reach them with a CORS-correct origin.
 
-Map manifestFor(File dir, String name) {
+// Environment for a CX pod: LCP.json env is what a CX declares it needs, but the
+// VALUES (cloud secrets/config) come from the environment. Mirror the CX's own
+// `docker run --env-file` local-dev flow -- read a sibling "<name>.env" next to
+// the artifact (or "local.env" inside a source dir) and feed it as pod env.
+// LCP.json env wins on conflict.
+
+Map<String, String> loadEnvFile(File entry, String name) {
+	List<File> candidates = [new File(entry.parentFile, "${name}.env")]
+
+	if (entry.isDirectory()) {
+		candidates << new File(entry, "local.env")
+	}
+
+	Map<String, String> env = [:]
+
+	candidates.findAll {
+		File file ->
+
+		file.exists()
+	}.each {
+		File file ->
+
+		file.eachLine {
+			String line ->
+
+			String trimmed = line.trim()
+
+			int eq = trimmed.indexOf("=")
+
+			if (trimmed && !trimmed.startsWith("#") && (eq > 0)) {
+				env[trimmed.substring(0, eq)] = trimmed.substring(eq + 1)
+			}
+		}
+	}
+
+	return env
+}
+
+Map manifestFor(File dir, String name, File entry) {
 	def lcp = new JsonSlurper().parse(new File(dir, "LCP.json"))
 
 	String sid = lcp.id
 	String vid = resolveVirtualInstance(sid, name, bakedVirtualInstanceId(dir))
+
+	Map<String, String> extraEnv = loadEnvFile(entry, name)
 
 	// The same CX can target more than one virtual instance (a per-VI variant
 	// artifact carries its own vid). The LCP.json id (sid) is identical across
@@ -236,7 +276,7 @@ Map manifestFor(File dir, String name) {
 	Map<String, String> selector = [app: sid, domain: vid]
 
 	Map container = [
-		env: (lcp.env ?: [:]).collect {
+		env: (extraEnv + (lcp.env ?: [:])).collect {
 			key, value ->
 
 			[name: key, value: value.toString()]
@@ -555,7 +595,7 @@ ext.deployOneCx = {
 		return
 	}
 
-	Map manifest = manifestFor(dir, name)
+	Map manifest = manifestFor(dir, name, entry)
 
 	logger.lifecycle(">> ${manifest.vid}/${manifest.sid} (image ${manifest.image})")
 
@@ -682,7 +722,7 @@ tasks.register("renderClientExtensions") {
 				return
 			}
 
-			Map manifest = manifestFor(dir, name)
+			Map manifest = manifestFor(dir, name, entry)
 
 			def nodePort = manifest.hasService ? nodePortFor(manifest.deployName) : null
 
