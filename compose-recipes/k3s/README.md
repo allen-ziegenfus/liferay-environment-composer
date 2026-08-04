@@ -54,6 +54,16 @@ cp liferay-sample-workspace/client-extensions/*/dist/*.zip \
 	my-lec-workspace/client-extensions/liferay.com/
 ```
 
+### Supplying environment to a CX
+
+A microservice CX often needs cloud config/secret **values** its `LCP.json` only
+*declares* it consumes (for example a Spring Boot CX's `${...}` placeholders). Drop
+a **`<name>.env`** file (plain `KEY=value` lines) next to the CX artifact — or a
+`local.env` inside a source-directory CX — and the recipe merges it into that CX's
+pod environment (the CX's own `LCP.json` `env` wins on conflict). This is the k8s
+equivalent of the CX's local `docker run --env-file` flow: nothing is baked into
+the image and `LCP.json` is untouched.
+
 ## What it deploys
 
 For each CX an image is built and imported into the cluster's containerd, then a
@@ -138,12 +148,16 @@ The vid is resolved by this precedence (first match wins):
 
 1. `client-extensions/virtual-instances.properties`, with `<name-or-sid> = <vid>`
    lines (relocate the file with `-PviMapping=<path>`)
-2. `-PvirtualInstance.<name>=<vid>` or `-PvirtualInstance.<sid>=<vid>` (per CX)
-3. `-PvirtualInstanceId=<vid>` (workspace default)
-4. the CX's **baked-in** `dxp.lxc.liferay.com.virtualInstanceId` — per-VI variant
+
+1. `-PvirtualInstance.<name>=<vid>` or `-PvirtualInstance.<sid>=<vid>` (per CX)
+
+1. `-PvirtualInstanceId=<vid>` (workspace default)
+
+1. the CX's **baked-in** `dxp.lxc.liferay.com.virtualInstanceId` — per-VI variant
    artifacts carry it in their config, so such a variant registers under its own
    instance with no external mapping
-5. `default`
+
+1. `default`
 
 The `<name>` is the CX's directory/zip name; the `<sid>` is its `LCP.json` `id`.
 For example, to split two different CX across instances:
