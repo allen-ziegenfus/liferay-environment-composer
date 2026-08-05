@@ -477,9 +477,10 @@ Map manifestFor(File dir, String name, File entry) {
 			}
 		}
 
-		// The ext-provision ConfigMap is the registration PortalK8sAgent reads. A
-		// browser origin -> the ingress URL (CORS); Liferay backend calls ->
-		// k3s:<nodePort>.
+		// The ext-provision ConfigMap is the registration PortalK8sAgent reads.
+		// Endpoints resolve to the ingress URL (reachable from the browser and,
+		// via the localhost-proxy socat, from Liferay too). serviceAddress (the
+		// NodePort) is kept only for a CX config's ".serviceAddress" field.
 
 		String serviceAddress = nodePort ? "${k3sHost}:${nodePort}" : null
 
@@ -500,38 +501,20 @@ Map manifestFor(File dir, String name, File entry) {
 
 				if (value instanceof Map) {
 
-					// objectAction is a server-side webhook: the Liferay backend
-					// calls baseURL + resourcePath. It must use the in-cluster
-					// NodePort (k3s:<nodePort>) -- the browser ingress host
-					// (<sid>.<vid>.localtest.me) resolves to 127.0.0.1 inside the
-					// Liferay container (i.e. Liferay itself), so it is not
-					// reachable server-side. Browser-facing CX (custom elements,
-					// etc.) load from the ingress URL.
+					// Every CX endpoint resolves to the ingress URL. A CX ingress
+					// host resolves to loopback everywhere, and the localhost-proxy
+					// socat forwards Liferay's loopback:80 to traefik, so the SAME
+					// ingress URL reaches the CX from both the browser and Liferay's
+					// backend (object-action webhooks + the OAuth application
+					// audience). traefik routes on the Host header, so there is no
+					// NodePort split.
 
-					boolean serverSideCallback = value.type == "objectAction"
-
-					if (value.containsKey("baseURL")) {
-						if (serverSideCallback && serviceAddress) {
-							value.baseURL = "http://${serviceAddress}"
-						}
-						else if (ingressUrl) {
-							value.baseURL = ingressUrl
-						}
+					if (ingressUrl && value.containsKey("baseURL")) {
+						value.baseURL = ingressUrl
 					}
 
-					// homePageURL is the CX's own service endpoint. It is consumed
-					// SERVER-SIDE: it becomes the OAuth application's audience and
-					// the address PortalCatapultImpl posts object-action webhooks to.
-					// It must therefore be the in-cluster NodePort, not the browser
-					// ingress host (…localtest.me resolves to 127.0.0.1, which inside
-					// the Liferay container is Liferay itself).
-					if (value.containsKey("homePageURL")) {
-						if (serviceAddress) {
-							value.homePageURL = "http://${serviceAddress}"
-						}
-						else if (ingressUrl) {
-							value.homePageURL = ingressUrl
-						}
+					if (ingressUrl && value.containsKey("homePageURL")) {
+						value.homePageURL = ingressUrl
 					}
 
 					if (serviceAddress && value.containsKey(".serviceAddress")) {
