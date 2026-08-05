@@ -356,7 +356,11 @@ Map manifestFor(File dir, String name, File entry) {
 	if (needsLiferay) {
 		podSpec.initContainers = [
 			[
-				args: ["TCP-LISTEN:80,fork,reuseaddr", "TCP:${liferayAddress}"],
+				// Dual-stack listener: `localhost` resolves to ::1 (IPv6) first for
+				// many clients, so an IPv4-only TCP-LISTEN would get connection
+				// refused. TCP6-LISTEN + ipv6-v6only=0 accepts both ::1 and
+				// 127.0.0.1 and forwards to Liferay.
+				args: ["TCP6-LISTEN:80,fork,reuseaddr,ipv6-v6only=0", "TCP:${liferayAddress}"],
 				image: "alpine/socat:latest",
 				imagePullPolicy: "IfNotPresent",
 				name: "liferay-proxy",
