@@ -129,13 +129,36 @@ Serving Liferay on `:80` via traefik makes the browser's page origin exactly
 `…localtest.me` passes CORS. Reaching Liferay on `:8080` would make the origin
 `http://localhost:8080` and CX CORS would fail.
 
-### Endpoints resolve to the ingress URL
+### `baseURL` / `homePageURL` — what they mean and why we rewrite them
 
-Because the `localhost-proxy` makes the ingress reachable from Liferay too, the
-plugin rewrites every CX config's `baseURL` and `homePageURL` to the single
-ingress URL `http://<sid>.<vid>.localtest.me` when it renders the ext-provision
-ConfigMap — server-side callers (object-action webhooks, OAuth-app audiences) and
-the browser all use the same address.
+A CX config carries a few address fields. What they *should* be depends on how the
+CX is hosted, which is the source of a lot of confusion:
+
+| field | what it is | value in the archive | who consumes it |
+|---|---|---|---|
+| `baseURL` | the address a client uses to reach the CX's HTTP surface (assets, REST) | `${portalURL}/o/<cx>` | browser / callers |
+| `homePageURL` | the CX's **own** service endpoint | `$[conf:.serviceScheme]://$[conf:.serviceAddress]` | OAuth-app audience; direct callers |
+| `.serviceAddress` / `.serviceScheme` | the raw host + scheme the above resolve against | the CX's declared address | the templates above |
+
+The key insight is what `${portalURL}/o/<cx>` means. `/o/<cx>` is the path Liferay
+mounts a CX under. **When a CX is hosted inside Liferay's JVM** (the classic model —
+a CX zip deployed straight into the portal), Liferay *serves* it at
+`${portalURL}/o/<cx>`, so `baseURL` = Liferay's own domain is correct. **When a CX
+is a separate microservice** (this recipe), Liferay does not serve it — it runs as
+its own workload with its own address, and there is no `/o/<cx>` handler in the
+local portal (a request to `…/o/<cx>` returns **404**). So the archive's
+`${portalURL}/o/<cx>` is a dead end here.
+
+That is why the plugin **rewrites** both `baseURL` and `homePageURL` to the CX's
+own ingress URL `http://<sid>.<vid>.localtest.me`. The `localhost-proxy` makes that
+ingress reachable from Liferay too, so one address serves the browser and the
+server-side callers (object-action webhooks, OAuth-app audiences) alike.
+
+> **Cloud vs. local.** In Liferay Cloud a microservice CX *is* reachable at
+> `${portalURL}/o/<cx>` because the platform proxies that path to the CX service.
+> This local recipe has no such proxy, so it points clients at the CX's ingress
+> directly instead. (Wiring up an `/o/<cx>`→service proxy to match cloud exactly is
+> a possible future direction; for now the ingress URL is the CX's address.)
 
 ## Multiple virtual instances
 

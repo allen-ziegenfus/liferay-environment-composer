@@ -544,7 +544,16 @@ Map manifestFor(File dir, String name, File entry) {
 			data: data,
 			kind: "ConfigMap",
 			metadata: [
-				annotations: ["lxc.liferay.com/lcp-json": JsonOutput.toJson(lcp)],
+				annotations: [
+					// Feed the CX's own host to Liferay's BaseURLPortalK8sConfiguration
+					// PropertiesMutator. It checks this annotation FIRST and, when
+					// set, uses it instead of calling getCompanyByWebId(vid) -- which
+					// would throw NoSuchCompanyException for a placeholder vid like
+					// "default". So this both silences that error and makes the mutator
+					// resolve the CX's baseURL/.serviceAddress to its ingress host.
+					"ext.lxc.liferay.com/mainDomain": "${sid}.${vid}.localtest.me",
+					"lxc.liferay.com/lcp-json": JsonOutput.toJson(lcp)
+				],
 				labels: [
 					(managedLabel): "true",
 					"dxp.lxc.liferay.com/virtualInstanceId": vid,
