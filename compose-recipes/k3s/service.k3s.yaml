@@ -40,6 +40,12 @@ services:
             # Include the "k3s" hostname in the API serving cert so the
             # PortalK8sAgent can verify TLS when connecting to k3s:6443.
             -   --tls-san=k3s
+            # Pin the node name so a restart re-registers the SAME node (updating
+            # its IP) instead of registering a fresh one under the container's
+            # random hostname and orphaning the old one. Stale NotReady "ghost"
+            # nodes break `kubectl logs`/stern: the API server proxies log requests
+            # to the ghost node's dead IP:10250 -> 502 Bad Gateway.
+            -   --node-name=k3s
             -   --flannel-backend=host-gw       # single-node: no vxlan tunnel setup
             # Lean/fast: k3s's built-in traefik (HelmChart + helm-controller + servicelb)
             # is slow to reconcile, so we disable it and deploy a minimal traefik
