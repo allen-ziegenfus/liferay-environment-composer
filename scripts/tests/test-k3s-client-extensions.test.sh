@@ -48,17 +48,23 @@ teardown() {
 	assert_output --partial 'alpine/socat'
 	assert_output --partial '"restartPolicy": "Always"'
 
-	# baseURL is address-type-aware: objectAction (server-side webhook) resolves
-	# to the in-cluster NodePort, while browser-facing CX use the ingress host.
-	assert_output --partial 'http://k3s:'
-	assert_output --partial '.localtest.me'
+	# Metadata mounts follow cloud's LXCExtensionVolumesContributor: dxp-metadata
+	# on every CX; ext-init-metadata ONLY for a CX with an OAuth app. So the OAuth
+	# fixture gets an ext-init mount, but the static cx-vi-variant (customElement)
+	# does not.
+	assert_output --partial '/etc/liferay/lxc/dxp-metadata'
+	assert_output --partial 'lxc-ext-init-metadata'
+	refute_output --partial 'cxvivariant-liferay.com-lxc-ext-init-metadata'
 
-	# homePageURL is consumed server-side (OAuth app audience + the address the
-	# object-action catapult posts to), so it must resolve to the NodePort, never
-	# the browser ingress host. (It is rendered inside the ext-provision ConfigMap
-	# as escaped JSON, hence the loose match around the key.)
-	assert_output --regexp 'homePageURL.{2,6}http://k3s:'
-	refute_output --regexp 'homePageURL.{2,6}http://cxoauthaction'
+	# Endpoints resolve to the ingress URL for every CX -- the localhost-proxy
+	# socat makes the ingress reachable from Liferay too, so there is no NodePort
+	# split. Both baseURL and homePageURL become the ingress host, and no endpoint
+	# points at http://k3s:<nodePort>. (Config is rendered as escaped JSON inside
+	# the ext-provision ConfigMap, hence the loose match around each key.)
+	assert_output --partial '.localtest.me'
+	assert_output --regexp 'baseURL[^,]*localtest\.me'
+	assert_output --regexp 'homePageURL[^,]*localtest\.me'
+	refute_output --partial 'http://k3s:'
 }
 
 @test "renderClientExtensions discovers a packaged (*.zip) CX like a source directory" {

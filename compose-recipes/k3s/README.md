@@ -90,17 +90,19 @@ direct/admin access.
 ```
 [4] browser ── http://localhost ─────────────────▶ traefik :80 ──▶ liferay (ExternalName svc) ──▶ liferay:8080
 [3] browser ── http://<sid>.<vid>.localtest.me ──▶ traefik :80 ──▶ CX Service ──▶ CX pod
-[1] liferay ── http://k3s:<nodePort> ────────────▶ CX Service (NodePort) ──▶ CX pod
+[1] liferay ── http://<sid>.<vid>.localtest.me ──(loopback:80 → localhost-proxy socat)──▶ traefik :80 ──▶ CX
 [2] CX pod  ── http://localhost:80 ──(socat)─────▶ liferay:8080
 ```
 
-**[1] Liferay → CX** — server-side webhooks (object actions). Liferay's backend
-calls the CX at its NodePort, reachable on the Docker network via the `k3s` alias
-(`http://k3s:<nodePort>`, which is the CX's `.serviceAddress`). This is **not** the
-ingress URL: `…localtest.me` resolves to `127.0.0.1`, which inside the Liferay
-container is Liferay itself, and a `baseURL` cannot carry a `Host` header for
-traefik to route on. Server-side calls have no CORS/browser concern, so the direct
-NodePort is correct.
+**[1] Liferay → CX** — server-side webhooks (object actions) and OAuth-app
+audiences. Liferay's backend calls the CX at the **same ingress URL the browser
+uses** (`http://<sid>.<vid>.localtest.me`). That host resolves to loopback
+(`127.0.0.1`/`::1`) everywhere, so inside the Liferay container it hits the
+**`localhost-proxy`** socat (bound to `127.0.0.1:80` in Liferay's network
+namespace, see `liferay.k3s.yaml`), which forwards to `k3s:80` (traefik); traefik
+routes on the `Host` header (implicit in the URL) to the CX. One address therefore
+serves both the browser and Liferay — no NodePort split. (The CX Service still
+gets a NodePort, but nothing addresses it directly.)
 
 **[2] CX → Liferay** — server-side calls from a CX pod (OAuth token requests,
 headless API calls). The `dxp-metadata` advertises the portal at `localhost` over
@@ -127,15 +129,13 @@ Serving Liferay on `:80` via traefik makes the browser's page origin exactly
 `…localtest.me` passes CORS. Reaching Liferay on `:8080` would make the origin
 `http://localhost:8080` and CX CORS would fail.
 
-### `baseURL` is address-type-aware
+### Endpoints resolve to the ingress URL
 
-Because paths [1] and [3] need different addresses, the plugin rewrites each CX
-config's `baseURL` by type when it renders the ext-provision ConfigMap:
-
-| CX config type | `baseURL` | reached by |
-|---|---|---|
-| `objectAction` (server-side webhook) | `http://k3s:<nodePort>` | Liferay backend — path [1] |
-| everything else (custom element, …) | `http://<sid>.<vid>.localtest.me` | browser — path [3] |
+Because the `localhost-proxy` makes the ingress reachable from Liferay too, the
+plugin rewrites every CX config's `baseURL` and `homePageURL` to the single
+ingress URL `http://<sid>.<vid>.localtest.me` when it renders the ext-provision
+ConfigMap — server-side callers (object-action webhooks, OAuth-app audiences) and
+the browser all use the same address.
 
 ## Multiple virtual instances
 
