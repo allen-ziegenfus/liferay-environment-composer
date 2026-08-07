@@ -109,6 +109,36 @@ teardown() {
 	refute_output --partial '.default.localtest.me'
 }
 
+@test "renderClientExtensions orders CX by LCP.json dependencies (cloud parity)" {
+	_debug "RUNNING ${BATS_TEST_NAME}"
+
+	# Declare that the serving CX depends on the job CX -- the same LCP.json field
+	# Liferay Cloud uses. The dependency must be rendered/deployed first.
+	local lcp="${TEST_WORKSPACE_DIR}/client-extensions/cx-serving/LCP.json"
+
+	python3 - "${lcp}" <<-'PY'
+		import json, sys
+		p = sys.argv[1]
+		d = json.load(open(p))
+		d["dependencies"] = ["cxjob"]
+		json.dump(d, open(p, "w"), indent="\t")
+	PY
+
+	run ./gradlew renderClientExtensions --quiet --console=plain
+
+	assert_success
+
+	# The per-CX header lines (`# ===== <vid>/<sid> ...`) reflect deploy order.
+	# cxjob (the dependency) must appear before cxserving (the dependent).
+	local job_line serving_line
+	job_line="$(printf '%s\n' "${output}" | grep -n '^# =====' | grep 'cxjob' | head -1 | cut -d: -f1)"
+	serving_line="$(printf '%s\n' "${output}" | grep -n '^# =====' | grep 'cxserving' | head -1 | cut -d: -f1)"
+
+	assert [ -n "${job_line}" ]
+	assert [ -n "${serving_line}" ]
+	assert [ "${job_line}" -lt "${serving_line}" ]
+}
+
 @test "renderClientExtensions honors a CX's baked-in vid and names objects by sid+vid" {
 	_debug "RUNNING ${BATS_TEST_NAME}"
 

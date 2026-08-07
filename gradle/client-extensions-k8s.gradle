@@ -93,6 +93,90 @@ List<File> discoverClientExtensions() {
 	return clientExtensions
 }
 
+// Order CX by their LCP.json "dependencies" (a list of other CX ids) -- the same
+// declarative field Liferay Cloud uses. Reproduces cloud's topological wave
+// ordering (cloud/api DeploymentManager -> dependency-groups): a CX is deployed
+// only after everything it depends on. Like cloud, this is a DEPLOY-ORDER, not a
+// completion wait -- a dependency is "satisfied" once it has been deployed, not
+// once it has finished running.
+//
+// Divergence from cloud (which hard-errors): a dependency on an id not staged in
+// this workspace is ignored (local workspaces are often partial), and a cycle
+// falls back to discovery order -- both warn rather than abort the deploy.
+List<File> orderByDependencies(List<File> entries) {
+	if (entries.size() < 2) {
+		return entries
+	}
+
+	Map<String, File> entryById = [:]
+	Map<String, List<String>> depsById = [:]
+
+	entries.each {
+		File entry ->
+
+		File lcpFile = new File(materialize(entry), "LCP.json")
+
+		if (!lcpFile.exists()) {
+			return
+		}
+
+		def lcp = new JsonSlurper().parse(lcpFile)
+		String id = (lcp.id ?: (entry.name - ".zip")).toString().toLowerCase()
+
+		entryById[id] = entry
+		depsById[id] = (lcp.dependencies ?: []).collect {
+			it.toString().toLowerCase()
+		}
+	}
+
+	Set<String> known = entryById.keySet()
+
+	List<String> unknownDeps = depsById.values().flatten().findAll {
+		!known.contains(it)
+	}.unique()
+
+	if (unknownDeps) {
+		logger.warn("client-extensions: ignoring dependencies not in this workspace: ${unknownDeps}")
+	}
+
+	Set<String> placed = [] as Set
+	List<File> ordered = []
+	List<String> remaining = known.toList()
+
+	while (!remaining.isEmpty()) {
+		List<String> wave = remaining.findAll {
+			id ->
+
+			depsById[id].every {
+				dep ->
+
+				placed.contains(dep) || !known.contains(dep)
+			}
+		}
+
+		if (wave.isEmpty()) {
+			logger.warn("client-extensions: dependency cycle among ${remaining}; deploying in discovery order")
+
+			wave = remaining
+		}
+
+		wave.each {
+			id ->
+
+			ordered << entryById[id]
+			placed << id
+		}
+
+		remaining -= wave
+	}
+
+	// Entries whose LCP.json had no readable id keep their original slot, at the
+	// end (deployOneCx skips anything without an LCP.json anyway).
+	return ordered + entries.findAll {
+		!ordered.contains(it)
+	}
+}
+
 // Normalize an entry to a directory that has LCP.json. Only place where the
 // zip-vs-source distinction matters.
 
@@ -725,7 +809,7 @@ tasks.register("deployClientExtensions") {
 	group = "liferay k8s"
 
 	doLast {
-		discoverClientExtensions().each {
+		orderByDependencies(discoverClientExtensions()).each {
 			File entry ->
 
 			deployOneCx(entry)
@@ -772,7 +856,7 @@ tasks.register("renderClientExtensions") {
 	group = "liferay k8s"
 
 	doLast {
-		discoverClientExtensions().each {
+		orderByDependencies(discoverClientExtensions()).each {
 			File entry ->
 
 			String name = entry.isDirectory() ? entry.name : (entry.name - ".zip")

@@ -79,6 +79,34 @@ workload is applied per its `LCP.json` `kind` (and whether it serves a port):
 Every CX — serving, batch, cron, or config-only — also gets an **ext-provision**
 ConfigMap: the registration the `PortalK8sAgent` reads to surface the CX in Liferay.
 
+Each workload is created only once the ConfigMaps it mounts (`dxp-metadata`, and
+`ext-init` for OAuth CX) actually exist — the deploy waits for them rather than
+letting a pod sit in the kubelet's mount-retry backoff.
+
+## Deploy ordering
+
+CX deploy in the order implied by their `LCP.json` **`dependencies`** — the same
+declarative field Liferay Cloud uses (a list of other CX ids). The set is sorted
+topologically, so a CX is deployed only after everything it depends on:
+
+```json
+{
+	"dependencies": [
+		"liferayonebatch"
+	],
+	"id": "liferayonesiteinitializer"
+}
+```
+
+Like cloud, this is a **deploy-order, not a completion wait**: a dependency is
+"satisfied" once it has been *deployed* ahead of the dependent — not once it has
+finished *running*. So for two `Job` CX, the dependency is submitted first, but
+its Job is not guaranteed to have completed before the dependent starts.
+
+Divergences from cloud (which hard-errors): a dependency on an id **not staged in
+this workspace** is ignored with a warning (local workspaces are often partial),
+and a **cycle** falls back to discovery order with a warning rather than aborting.
+
 ## Network paths
 
 The environment spans two networks — the Docker Compose network (Liferay, the
