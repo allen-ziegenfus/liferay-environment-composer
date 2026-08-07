@@ -402,12 +402,20 @@ Map manifestFor(File dir, String name, File entry) {
 		])
 	}
 
-	// Phase 2: workload + Ingress + ext-provision ConfigMap, rendered once the
-	// nodePort is known.
+	// The ConfigMaps this workload mounts. deployOneCx gates workload creation on
+	// their existence (Phase 2b there): PortalK8sAgent produces dxp-metadata and
+	// ext-init asynchronously, so creating the pod first makes the kubelet enter
+	// capped-exponential mount backoff -- a ~2 min idle stall after they land.
+	List requiredConfigMaps = volumes.findAll {
+		it.configMap
+	}.collect {
+		it.configMap.name
+	}
 
-	Closure restFor = {
-		nodePort ->
+	// Phase 2c: the workload (Deployment/Job/CronJob) + its Ingress. Applied only
+	// after requiredConfigMaps all exist. Independent of the nodePort.
 
+	Closure workloadFor = {
 		List items = []
 
 		if (isCronJob) {
@@ -481,10 +489,18 @@ Map manifestFor(File dir, String name, File entry) {
 			}
 		}
 
-		// The ext-provision ConfigMap is the registration PortalK8sAgent reads.
-		// Endpoints resolve to the ingress URL (reachable from the browser and,
-		// via the localhost-proxy socat, from Liferay too). serviceAddress (the
-		// NodePort) is kept only for a CX config's ".serviceAddress" field.
+		return JsonOutput.toJson([apiVersion: "v1", items: items, kind: "List"])
+	}
+
+	// Phase 2a: the ext-provision ConfigMap -- the registration PortalK8sAgent
+	// reads to (re)create ext-init and refresh dxp-metadata. Applied FIRST so the
+	// agent produces the mounts the workload needs. Endpoints resolve to the
+	// ingress URL (reachable from the browser and, via the localhost-proxy socat,
+	// from Liferay too). serviceAddress (the NodePort) is kept only for a CX
+	// config's ".serviceAddress" field.
+
+	Closure extProvisionFor = {
+		nodePort ->
 
 		String serviceAddress = nodePort ? "${k3sHost}:${nodePort}" : null
 
@@ -539,7 +555,7 @@ Map manifestFor(File dir, String name, File entry) {
 			data[configFile.name] = JsonOutput.toJson(config)
 		}
 
-		items << [
+		return JsonOutput.toJson([
 			apiVersion: "v1",
 			data: data,
 			kind: "ConfigMap",
@@ -562,9 +578,7 @@ Map manifestFor(File dir, String name, File entry) {
 				],
 				name: "${deployName}-ext-provision"
 			]
-		]
-
-		return JsonOutput.toJson([apiVersion: "v1", items: items, kind: "List"])
+		])
 	}
 
 	return [
@@ -574,9 +588,11 @@ Map manifestFor(File dir, String name, File entry) {
 		ingressUrl: ingressUrl,
 		isCronJob: isCronJob,
 		isJob: isJob,
+		extProvisionFor: extProvisionFor,
 		needsLiferay: needsLiferay,
-		restFor: restFor,
+		requiredConfigMaps: requiredConfigMaps,
 		serviceJson: serviceJson,
+		workloadFor: workloadFor,
 		sid: sid,
 		vid: vid
 	]
@@ -640,9 +656,36 @@ ext.deployOneCx = {
 		nodePort = out.toString().trim().toInteger()
 	}
 
-	// Phase 2: workload + Ingress + ext-provision ConfigMap (with the resolved
-	// address). The :latest tag means apply won't roll, so Jobs/CronJobs
-	// delete+recreate and Deployments rollout restart.
+	// Phase 2a: apply the ext-provision ConfigMap -- the trigger PortalK8sAgent
+	// reads to (re)create ext-init and refresh dxp-metadata.
+
+	kubectlApply(manifest.extProvisionFor(nodePort))
+
+	// Phase 2b: wait until every ConfigMap the workload mounts exists, so the pod
+	// is created only when its volumes are satisfiable. Otherwise the kubelet
+	// fails the mount and backs off (capped-exponential, ~120s), idling long
+	// after the agent finally writes them. dxp-metadata is the cold-start long
+	// pole (company-level, written once); once present, later CX gate instantly.
+
+	if (manifest.requiredConfigMaps) {
+		logger.lifecycle(" waiting for metadata: ${manifest.requiredConfigMaps.join(", ")}")
+
+		manifest.requiredConfigMaps.each {
+			cm ->
+
+			exec {
+				commandLine "docker", "exec", k3s, "kubectl", "wait", "--for=create", "configmap/${cm}", "--timeout=300s"
+			}
+		}
+	}
+
+	// Phase 2c: workload + Ingress. The :latest tag means apply won't roll, so
+	// Jobs/CronJobs delete+recreate; an EXISTING Deployment needs a rollout
+	// restart to re-pull the reimported image. On first create, apply already
+	// starts the pod, so the restart is skipped -- otherwise it spawns a second
+	// ReplicaSet that has to wait on the mounts all over again.
+
+	boolean deploymentExisted = false
 
 	if (manifest.isJob) {
 		exec {
@@ -654,10 +697,18 @@ ext.deployOneCx = {
 			commandLine "docker", "exec", k3s, "kubectl", "delete", "cronjob", manifest.deployName, "--ignore-not-found"
 		}
 	}
+	else {
+		deploymentExisted = exec {
+			commandLine "docker", "exec", k3s, "kubectl", "get", "deployment", manifest.deployName
+			ignoreExitValue = true
+			standardOutput = new ByteArrayOutputStream()
+			errorOutput = new ByteArrayOutputStream()
+		}.exitValue == 0
+	}
 
-	kubectlApply(manifest.restFor(nodePort))
+	kubectlApply(manifest.workloadFor())
 
-	if (!manifest.isJob && !manifest.isCronJob) {
+	if (deploymentExisted) {
 		exec {
 			commandLine "docker", "exec", k3s, "kubectl", "rollout", "restart", "deployment/${manifest.deployName}"
 			ignoreExitValue = true
@@ -742,7 +793,8 @@ tasks.register("renderClientExtensions") {
 				println JsonOutput.prettyPrint(manifest.serviceJson)
 			}
 
-			println JsonOutput.prettyPrint(manifest.restFor(nodePort))
+			println JsonOutput.prettyPrint(manifest.extProvisionFor(nodePort))
+			println JsonOutput.prettyPrint(manifest.workloadFor())
 		}
 	}
 }
