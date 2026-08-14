@@ -93,23 +93,15 @@ List<File> discoverClientExtensions() {
 	return clientExtensions
 }
 
-// Order CX by their LCP.json "dependencies" (a list of other CX ids) -- the same
-// declarative field Liferay Cloud uses. Reproduces cloud's topological wave
-// ordering (cloud/api DeploymentManager -> dependency-groups): a CX is deployed
-// only after everything it depends on. Like cloud, this is a DEPLOY-ORDER, not a
-// completion wait -- a dependency is "satisfied" once it has been deployed, not
-// once it has finished running.
-//
-// Divergence from cloud (which hard-errors): a dependency on an id not staged in
-// this workspace is ignored (local workspaces are often partial), and a cycle
-// falls back to discovery order -- both warn rather than abort the deploy.
+// Order CX by their LCP.json "dependencies" (the field Liferay Cloud uses): a
+// topological sort so each CX deploys after the ones it depends on.
 List<File> orderByDependencies(List<File> entries) {
 	if (entries.size() < 2) {
 		return entries
 	}
 
 	Map<String, File> entryById = [:]
-	Map<String, List<String>> depsById = [:]
+	Map<String, List<String>> dependencyIdsById = [:]
 
 	entries.each {
 		File entry ->
@@ -124,56 +116,54 @@ List<File> orderByDependencies(List<File> entries) {
 		String id = (lcp.id ?: (entry.name - ".zip")).toString().toLowerCase()
 
 		entryById[id] = entry
-		depsById[id] = (lcp.dependencies ?: []).collect {
+		dependencyIdsById[id] = (lcp.dependencies ?: []).collect {
 			it.toString().toLowerCase()
 		}
 	}
 
-	Set<String> known = entryById.keySet()
+	Set<String> knownIds = entryById.keySet()
 
-	List<String> unknownDeps = depsById.values().flatten().findAll {
-		!known.contains(it)
+	List<String> unresolvableIds = dependencyIdsById.values().flatten().findAll {
+		!knownIds.contains(it)
 	}.unique()
 
-	if (unknownDeps) {
-		logger.warn("client-extensions: ignoring dependencies not in this workspace: ${unknownDeps}")
+	if (unresolvableIds) {
+		logger.warn("client-extensions: ignoring dependencies not in this workspace: ${unresolvableIds}")
 	}
 
-	Set<String> placed = [] as Set
-	List<File> ordered = []
-	List<String> remaining = known.toList()
+	Set<String> placedIds = [] as Set
+	List<File> orderedEntries = []
+	List<String> remainingIds = knownIds.toList()
 
-	while (!remaining.isEmpty()) {
-		List<String> wave = remaining.findAll {
+	while (!remainingIds.isEmpty()) {
+		List<String> readyIds = remainingIds.findAll {
 			id ->
 
-			depsById[id].every {
-				dep ->
+			dependencyIdsById[id].every {
+				dependencyId ->
 
-				placed.contains(dep) || !known.contains(dep)
+				placedIds.contains(dependencyId) || !knownIds.contains(dependencyId)
 			}
 		}
 
-		if (wave.isEmpty()) {
-			logger.warn("client-extensions: dependency cycle among ${remaining}; deploying in discovery order")
+		if (readyIds.isEmpty()) {
+			logger.warn("client-extensions: dependency cycle among ${remainingIds}; deploying in discovery order")
 
-			wave = remaining
+			readyIds = remainingIds
 		}
 
-		wave.each {
+		readyIds.each {
 			id ->
 
-			ordered << entryById[id]
-			placed << id
+			orderedEntries << entryById[id]
+			placedIds << id
 		}
 
-		remaining -= wave
+		remainingIds -= readyIds
 	}
 
-	// Entries whose LCP.json had no readable id keep their original slot, at the
-	// end (deployOneCx skips anything without an LCP.json anyway).
-	return ordered + entries.findAll {
-		!ordered.contains(it)
+	return orderedEntries + entries.findAll {
+		!orderedEntries.contains(it)
 	}
 }
 
@@ -486,18 +476,15 @@ Map manifestFor(File dir, String name, File entry) {
 		])
 	}
 
-	// The ConfigMaps this workload mounts. deployOneCx gates workload creation on
-	// their existence (Phase 2b there): PortalK8sAgent produces dxp-metadata and
-	// ext-init asynchronously, so creating the pod first makes the kubelet enter
-	// capped-exponential mount backoff -- a ~2 min idle stall after they land.
+	// The ConfigMaps this workload mounts; deploySingleCx waits for these before
+	// creating the pod (Phase 2b), so the kubelet never enters mount-backoff.
 	List requiredConfigMaps = volumes.findAll {
 		it.configMap
 	}.collect {
 		it.configMap.name
 	}
 
-	// Phase 2c: the workload (Deployment/Job/CronJob) + its Ingress. Applied only
-	// after requiredConfigMaps all exist. Independent of the nodePort.
+	// The workload manifest (Deployment/Job/CronJob) + its Ingress.
 
 	Closure workloadFor = {
 		List items = []
@@ -576,12 +563,8 @@ Map manifestFor(File dir, String name, File entry) {
 		return JsonOutput.toJson([apiVersion: "v1", items: items, kind: "List"])
 	}
 
-	// Phase 2a: the ext-provision ConfigMap -- the registration PortalK8sAgent
-	// reads to (re)create ext-init and refresh dxp-metadata. Applied FIRST so the
-	// agent produces the mounts the workload needs. Endpoints resolve to the
-	// ingress URL (reachable from the browser and, via the localhost-proxy socat,
-	// from Liferay too). serviceAddress (the NodePort) is kept only for a CX
-	// config's ".serviceAddress" field.
+	// The ext-provision ConfigMap -- the registration the PortalK8sAgent reads.
+	// serviceAddress (the NodePort) is kept only for a CX config's ".serviceAddress".
 
 	Closure extProvisionFor = {
 		nodePort ->
@@ -689,10 +672,10 @@ void kubectlApply(String json) {
 	}
 }
 
-// Build (or unpack) -> image -> import -> apply -> restart, for ONE client
+// Build (or unpack) -> image -> import -> apply -> restart, for a single client
 // extension. Reused by deployClientExtensions and each module's deployToK3s.
 
-ext.deployOneCx = {
+ext.deploySingleCx = {
 	File entry ->
 
 	String name = entry.isDirectory() ? entry.name : (entry.name - ".zip")
@@ -740,34 +723,27 @@ ext.deployOneCx = {
 		nodePort = out.toString().trim().toInteger()
 	}
 
-	// Phase 2a: apply the ext-provision ConfigMap -- the trigger PortalK8sAgent
-	// reads to (re)create ext-init and refresh dxp-metadata.
+	// Phase 2a: apply the ext-provision ConfigMap -- the trigger the agent reads.
 
 	kubectlApply(manifest.extProvisionFor(nodePort))
 
-	// Phase 2b: wait until every ConfigMap the workload mounts exists, so the pod
-	// is created only when its volumes are satisfiable. Otherwise the kubelet
-	// fails the mount and backs off (capped-exponential, ~120s), idling long
-	// after the agent finally writes them. dxp-metadata is the cold-start long
-	// pole (company-level, written once); once present, later CX gate instantly.
+	// Phase 2b: block until those ConfigMaps exist, so the pod never mount-backoffs.
 
 	if (manifest.requiredConfigMaps) {
 		logger.lifecycle(" waiting for metadata: ${manifest.requiredConfigMaps.join(", ")}")
 
 		manifest.requiredConfigMaps.each {
-			cm ->
+			configMapName ->
 
 			exec {
-				commandLine "docker", "exec", k3s, "kubectl", "wait", "--for=create", "configmap/${cm}", "--timeout=300s"
+				commandLine "docker", "exec", k3s, "kubectl", "wait", "--for=create", "configmap/${configMapName}", "--timeout=300s"
 			}
 		}
 	}
 
-	// Phase 2c: workload + Ingress. The :latest tag means apply won't roll, so
-	// Jobs/CronJobs delete+recreate; an EXISTING Deployment needs a rollout
-	// restart to re-pull the reimported image. On first create, apply already
-	// starts the pod, so the restart is skipped -- otherwise it spawns a second
-	// ReplicaSet that has to wait on the mounts all over again.
+	// Phase 2c: workload + Ingress. :latest won't roll, so Jobs/CronJobs
+	// delete+recreate and an existing Deployment gets a rollout restart -- skipped
+	// on first create, else it spawns a second ReplicaSet that re-waits on mounts.
 
 	boolean deploymentExisted = false
 
@@ -812,7 +788,7 @@ tasks.register("deployClientExtensions") {
 		orderByDependencies(discoverClientExtensions()).each {
 			File entry ->
 
-			deployOneCx(entry)
+			deploySingleCx(entry)
 		}
 	}
 }
@@ -845,7 +821,7 @@ gradle.projectsEvaluated {
 					throw new GradleException("no built zip from ${zipTask.path}")
 				}
 
-				rootProject.deployOneCx(zip)
+				rootProject.deploySingleCx(zip)
 			}
 		}
 	}
