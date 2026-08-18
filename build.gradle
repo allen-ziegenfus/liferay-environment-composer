@@ -561,4 +561,10 @@ if (config.services.contains("k3s")) {
 			logger.lifecycle("freshK3s: wiped k3s stack + ${ns}_k3s-data — next start is a clean cluster")
 		}
 	}
+
+	// Fold the cluster reset into clean: `lec clean` runs `gradlew clean`, so this
+	// makes it wipe the k3s stack + state volume too (skip with -PkeepK3sState).
+	tasks.matching { it.name == "clean" }.all {
+		it.dependsOn "freshK3s"
+	}
 }
