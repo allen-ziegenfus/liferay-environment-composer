@@ -729,15 +729,18 @@ ext.deploySingleCx = {
 
 	// Phase 2b: block until those ConfigMaps exist, so the pod never mount-backoffs.
 
-	if (manifest.requiredConfigMaps) {
-		logger.lifecycle(" waiting for metadata: ${manifest.requiredConfigMaps.join(", ")}")
+	manifest.requiredConfigMaps.each {
+		configMapName ->
 
-		manifest.requiredConfigMaps.each {
-			configMapName ->
+		if (configMapName.endsWith("-lxc-dxp-metadata")) {
+			logger.lifecycle(" waiting for company metadata ${configMapName} -- PortalK8sAgent writes it ~60-90s after Liferay boots on a cold start")
+		}
+		else {
+			logger.lifecycle(" waiting for ${configMapName}")
+		}
 
-			exec {
-				commandLine "docker", "exec", k3s, "kubectl", "wait", "--for=create", "configmap/${configMapName}", "--timeout=300s"
-			}
+		exec {
+			commandLine "docker", "exec", k3s, "kubectl", "wait", "--for=create", "configmap/${configMapName}", "--timeout=300s"
 		}
 	}
 
