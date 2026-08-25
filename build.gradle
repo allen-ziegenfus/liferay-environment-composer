@@ -263,8 +263,29 @@ tasks.register("stop") {
 }
 
 buildDockerImage {
+	// Don't force-pull the base FROM image: a locally built portal image isn't in
+	// any registry (docker resolves it locally, or pulls only if genuinely absent).
+	pull = false
+
 	doFirst {
-		waitForCommand("docker pull ${gradle.liferayWorkspace.dockerImageLiferay}", null, System.out)
+		def image = gradle.liferayWorkspace.dockerImageLiferay
+
+		def inspect = exec {
+			commandLine "docker", "image", "inspect", image
+
+			errorOutput = new ByteArrayOutputStream()
+			ignoreExitValue = true
+			standardOutput = new ByteArrayOutputStream()
+		}
+
+		// A locally built portal image can't be pulled from a registry; only pull
+		// when it is not already present.
+		if (inspect.exitValue == 0) {
+			logger.lifecycle("Using local image ${image}; skipping docker pull")
+		}
+		else {
+			waitForCommand("docker pull ${image}", null, System.out)
+		}
 	}
 
 	onlyIf("using the Liferay service") {
