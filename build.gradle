@@ -354,6 +354,12 @@ if (config.useClustering) {
 
 if (config.useLiferay) {
 	environmentMap.put "LIFERAY_IMAGE_NAME", config.liferayDockerImageId
+
+	// A locally built portal image may lack the stock /opt/liferay/health-check.sh;
+	// lr.docker.environment.liferay.healthcheck.test overrides the health check.
+	environmentMap.put(
+		"LIFERAY_HEALTHCHECK_TEST",
+		(project.findProperty("lr.docker.environment.liferay.healthcheck.test") ?: "/opt/liferay/health-check.sh"))
 }
 
 environmentMap.put("COMPOSE_FILE", config.composeFiles.join(File.pathSeparator))

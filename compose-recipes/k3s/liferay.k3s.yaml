@@ -3,6 +3,11 @@ services:
         depends_on:
             k3s:
                 condition: service_healthy
+        # Overridable via LIFERAY_HEALTHCHECK_TEST (property
+        # lr.docker.environment.liferay.healthcheck.test) -- a locally built portal
+        # image may lack the stock /opt/liferay/health-check.sh.
+        healthcheck:
+            test: ${LIFERAY_HEALTHCHECK_TEST:-/opt/liferay/health-check.sh}
     # A socat that joins Liferay's network namespace and forwards loopback :80 to
     # traefik in the k3s container. A CX ingress host resolves to loopback
     # everywhere (127.0.0.1 / ::1), so this gives Liferay's loopback:80 somewhere
