@@ -1005,7 +1005,9 @@ tasks.register("k3sKubeconfig") {
 		String containerIp = ipOut.toString().trim()
 
 		if (!containerIp) {
-			throw new GradleException("k3s container '${k3s}' is not running")
+			logger.warn("k3s container '${k3s}' is not running; skipping kubeconfig")
+
+			return
 		}
 
 		ByteArrayOutputStream configOut = new ByteArrayOutputStream()
@@ -1024,5 +1026,26 @@ tasks.register("k3sKubeconfig") {
 		logger.lifecycle("kubeconfig written: ${out} (server https://${containerIp}:6443)")
 		logger.lifecycle(" export KUBECONFIG=${out}")
 		logger.lifecycle(" kubectl get pods -A")
+
+		// Optionally point the DEFAULT kubeconfig (~/.kube/config) at this cluster
+		// so host kubectl works with no KUBECONFIG. The user's original is backed
+		// up once to ~/.kube/config.lec-backup before the first overwrite.
+		if (project.findProperty("lr.docker.environment.k3s.kubeconfig.default") == "true") {
+			File defaultConfig = new File(System.getProperty("user.home"), ".kube/config")
+
+			defaultConfig.parentFile.mkdirs()
+
+			File backup = new File(defaultConfig.parentFile, "config.lec-backup")
+
+			if (defaultConfig.exists() && !backup.exists()) {
+				backup.text = defaultConfig.text
+
+				logger.lifecycle("backed up existing ~/.kube/config -> ${backup}")
+			}
+
+			defaultConfig.text = out.text
+
+			logger.lifecycle("default kubeconfig overwritten: ${defaultConfig}")
+		}
 	}
 }

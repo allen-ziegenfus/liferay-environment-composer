@@ -516,6 +516,12 @@ if (config.services.contains("k3s")) {
 		}
 	}
 
+	// Also refresh build/kubeconfig on start (and overwrite ~/.kube/config when
+	// lr.docker.environment.k3s.kubeconfig.default=true) so host kubectl works.
+	tasks.matching { it.name == "start" }.all {
+		it.finalizedBy "k3sKubeconfig"
+	}
+
 	// Build source CX and stage their zips into client-extensions/liferay.com so
 	// they join the auto-deploy set. Gradle up-to-date checks skip unchanged CX.
 	tasks.register("stageClientExtensions", Copy) {
