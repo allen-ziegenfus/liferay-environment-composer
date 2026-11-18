@@ -8,8 +8,8 @@ plugins {
 	id "com.avast.gradle.docker-compose" version "0.17.10"
 	id "docker-common"
 	id "docker-database-saas"
+	id "docker-keycloak"
 	id "docker-liferay-bundle"
-	id "docker-webserver"
 }
 
 if (Boolean.getBoolean("env.mode.ci")) {
@@ -60,6 +60,16 @@ tasks.register("exportContainerData") {
 		updateGradleLocalProperties(["lr.docker.environment.data.directory" : hostPath])
 
 		logger.lifecycle("\nUpdated gradle-local.properties with the new value:\nlr.docker.environment.data.directory=${hostPath}")
+	}
+}
+
+tasks.register("printWebserverConfig") {
+	onlyIf("using a webserver") {
+		config.useWebserver
+	}
+
+	doFirst {
+		println waitForCommand("docker exec ${config.namespace}-webserver nginx -T")
 	}
 }
 
@@ -141,6 +151,33 @@ tasks.register("importDocumentLibraryStructure") {
 	}
 }
 
+Closure<Void> applyShareWorkspaceFilters = {
+	PatternFilterable patternFilterable ->
+
+	configure(patternFilterable) {
+		exclude ".gitkeep"
+		exclude ".gitignore"
+		exclude ".git"
+		exclude ".gradle"
+		exclude "binds"
+		exclude "buildSrc/build"
+		exclude "buildSrc/.gradle"
+		exclude "dumps/*"
+		exclude "scripts/tests"
+		exclude "scripts/vendor"
+		exclude "shared_workspaces"
+		exclude {
+			FileTreeElement fileTreeElement ->
+
+			fileTreeElement.relativePath.pathString.startsWith("exported_data/") &&
+			!fileTreeElement.relativePath.pathString.startsWith(config.dataDirectory)
+		}
+
+		include "${config.dataDirectory}/**"
+		include "**/*"
+	}
+}
+
 tasks.register("shareWorkspace7z") {
 	doLast {
 		if (!isProgramInstalled("7z")) {
@@ -154,33 +191,18 @@ tasks.register("shareWorkspace7z") {
 
 		fileListFile.parentFile.mkdirs()
 
-		fileListFile.text = fileTree('.') {
-			exclude ".gitkeep"
-			exclude ".gitignore"
-			exclude ".git"
-			exclude ".gradle"
-			exclude "binds"
-			exclude "buildSrc/build"
-			exclude "buildSrc/.gradle"
-			exclude "dumps/*"
-			exclude "shared_workspaces"
-			exclude {
-				FileTreeElement fileTreeElement ->
-
-				fileTreeElement.relativePath.pathString.startsWith("exported_data/") &&
-				!fileTreeElement.relativePath.pathString.startsWith(config.dataDirectory)
-			}
-
-			include "${config.dataDirectory}/**"
-			include "**/*"
-		}.files.collect {
+		fileListFile.text = fileTree('.', applyShareWorkspaceFilters).files.collect {
 			File file ->
 
 			project.relativePath(file)
 		}.join("\n")
 
+		String archivePassword = findProperty("archivePassword")
+
+		String encryptionFlags = archivePassword ? "-mhe=on -p'" + archivePassword.replace("'", "'\\''") + "' " : ""
+
 		try {
-			waitForCommand("7z a -m0=lzma2 -mx=1 -bsp2 ${archiveFileName} -i@${fileListFileName}")
+			waitForCommand("7z a -m0=lzma2 -mx=1 -bsp2 ${encryptionFlags}${archiveFileName} -i@${fileListFileName}")
 		}
 		finally {
 			fileListFile.delete()
@@ -191,36 +213,27 @@ tasks.register("shareWorkspace7z") {
 }
 
 tasks.register("shareWorkspaceZip", Zip) {
+	Zip zip ->
+
+	applyShareWorkspaceFilters(zip)
+
 	archiveFileName = provider {
 		"workspace_${config.namespace}_${timestamp}.zip"
 	}
 
 	destinationDirectory = file 'shared_workspaces'
 
+	doFirst {
+		if (findProperty("archivePassword")) {
+			throw new GradleException("Zip archives do not support AES-256 encryption. The 7z CLI must be installed in order to encrypt workspace archives. Follow the install instructions at https://7-zip.org/download.html.")
+		}
+	}
+
 	doLast {
 		logger.lifecycle "\nWorkspace zip: ${archiveFile.get()}\n"
 	}
 
-	exclude ".gitkeep"
-	exclude ".gitignore"
-	exclude ".git"
-	exclude ".gradle"
-	exclude "binds"
-	exclude "buildSrc/build"
-	exclude "buildSrc/.gradle"
-	exclude "dumps/*"
-	exclude "shared_workspaces"
-	exclude {
-		FileTreeElement fileTreeElement ->
-
-		fileTreeElement.relativePath.pathString.startsWith("exported_data/") &&
-		!fileTreeElement.relativePath.pathString.startsWith(config.dataDirectory)
-	}
-
 	from '.'
-
-	include "${config.dataDirectory}/**"
-	include "**/*"
 
 	outputs.upToDateWhen {
 		false
@@ -263,15 +276,18 @@ buildDockerImage {
 
 	dependsOn ":checkForLiferayLicense"
 	dependsOn ":prepareJDBCDriver"
+	dependsOn ":prepareSAXParser"
 
 	mustRunAfter ":importDatabaseDumps"
 }
 
 clean {
+	dependsOn ":cleanPrepareKeycloakSelfSignedCert"
+	dependsOn ":cleanPrepareLiferayKeystoreFile"
 	dependsOn ":cleanPrepareJDBCDriver"
 	dependsOn ":cleanPrepareHotfixes"
-	dependsOn ":cleanPrepareSelfSignedCert"
-	dependsOn ":cleanPrepareWebserverConfig"
+	dependsOn ":cleanPrepareSAXParser"
+	dependsOn ":cleanPrepareXugglerJar"
 	dependsOn ":cleanDownloadYourKitAgentZip"
 	dependsOn ":cleanPrepareYourKitAgent"
 }
@@ -279,12 +295,13 @@ clean {
 dockerDeploy {
 	dependsOn ":prepareJDBCDriver"
 	dependsOn ":prepareHotfixes"
+	dependsOn ":prepareSAXParser"
+	dependsOn ":prepareXugglerJar"
 	dependsOn ":prepareYourKitAgent"
 }
 
 composeBuild {
-	dependsOn ":prepareSelfSignedCert"
-	dependsOn ":prepareWebserverConfig"
+	dependsOn ":prepareLiferayKeystoreFile"
 }
 
 composeUp {
@@ -298,19 +315,27 @@ composeUp {
 
 	doFirst {
 		println "Using config:\n\n${config}\n\n"
+
+		if (config.useClustering && !config.services.contains("elasticsearch")) {
+			logger.warn("Clustering is enabled without the Elasticsearch service, so every Liferay node starts its own sidecar Elasticsearch. Search results can differ between nodes, and each node needs about 1.3 GB more memory. Set lr.docker.environment.service.enabled[elasticsearch]=true to share one Elasticsearch.")
+		}
 	}
 
 	finalizedBy ":listAdminUsers"
 	finalizedBy ":printBundleInfo"
+	finalizedBy ":printWebserverConfig"
 }
 
 Map<String, String> environmentMap = [:]
 
 environmentMap.put "DATA_DIRECTORY", config.dataDirectory
 environmentMap.put "DATABASE_NAME", config.databaseName
+environmentMap.put "DATABASE_PASSWORD", config.databasePassword
+environmentMap.put "DATABASE_USER", config.databaseUser
 environmentMap.put "NAMESPACE", config.namespace
 
 if (config.useClustering) {
+	environmentMap.put "LIFERAY_CLUSTER_NODE_START_PERIOD", "${config.clusterNodes * 10}m"
 	environmentMap.put "LIFERAY_CLUSTER_NODES", config.clusterNodes
 }
 
@@ -321,6 +346,28 @@ if (config.useLiferay) {
 environmentMap.put("COMPOSE_FILE", config.composeFiles.join(File.pathSeparator))
 environmentMap.put("COMPOSE_PROJECT_NAME", config.namespace)
 
+String validDLStoreTypes = "advanced,db,s3,simple"
+
+if (!validDLStoreTypes.contains(config.dlStore)) {
+	throw new GradleException("Invalid DL store type provided. Please see gradle.properties file for valid store types.")
+}
+
+if (config.dlStore == "advanced") {
+	environmentMap.put("DL_STORE_PATH", config.dlStorePath)
+}
+
+if (config.dlStore == "s3") {
+	environmentMap.put("S3_ACCESS_KEY", config.s3AccessKey)
+	environmentMap.put("S3_BUCKET_NAME", config.s3BucketName)
+	environmentMap.put("S3_REGION", config.s3Region)
+	environmentMap.put("S3_SECRET_KEY", config.s3SecretKey)
+}
+
+environmentMap.put("DL_STORE_CLASS", config.dlStoreClass)
+environmentMap.put("LIFERAY_VALID_HOSTS", config.webserverHostnames.replace(' ', ','))
+
+environmentMap.put("MEDIA_PREVIEW_ENABLED", config.mediaPreviewEnabled)
+
 file("ports.env").withInputStream {
 	portsFile ->
 
@@ -328,17 +375,71 @@ file("ports.env").withInputStream {
 
 	ports.load(portsFile)
 
-	environmentMap.putAll ports
+	if (config.useClustering) {
+		environmentMap.putAll ports
+
+		return
+	}
+
+	Set<Integer> projectPorts = getProjectBoundHostPorts()
+
+	environmentMap.putAll ports.collectEntries {
+		key, value ->
+
+		if (!value.contains("-")) {
+			return [key, value]
+		}
+
+		String[] parts = value.split("-")
+
+		Integer portLowest = parts[0] as Integer
+		Integer portHighest = parts[1] as Integer
+
+		Integer availablePort = getFirstAvailablePort(portLowest, portHighest, projectPorts)
+
+		if (availablePort == null) {
+			throw new GradleException("No free port found in range: ${value}. Please shut down other projects, or expand the port range in the ports.env file.")
+		}
+
+		return [key, availablePort.toString()]
+	}
 }
 
-file("versions.env").withInputStream {
-	versionsFile ->
+if (config.useWebserver) {
+	environmentMap.put("WEBSERVER_HOSTNAMES", config.webserverHostnames)
+	environmentMap.put("WEBSERVER_MODSECURITY_ENABLED", config.modSecurityEnabled)
+	environmentMap.put("WEBSERVER_PROTOCOL", config.webserverProtocol)
+	environmentMap.put("WEBSERVER_PROTOCOL_UPPERCASE", config.webserverProtocol.toUpperCase())
 
-	Properties versions = new Properties()
+	if (config.webserverProtocol == "http") {
+		environmentMap.put("WEBSERVER_CONTAINER_PORT", "8080")
+		environmentMap.put("LIFERAY_CONTAINER_PORT", "80")
+		environmentMap.put("WEBSERVER_HOST_PORT", environmentMap["WEBSERVER_HTTP_PORT"])
+	}
 
-	versions.load(versionsFile)
+	if (config.webserverProtocol == "https") {
+		environmentMap.put("WEBSERVER_CONTAINER_PORT", "8443")
+		environmentMap.put("LIFERAY_CONTAINER_PORT", "443")
+		environmentMap.put("WEBSERVER_HOST_PORT", environmentMap["WEBSERVER_HTTPS_PORT"])
+	}
+}
 
-	environmentMap.putAll versions
+if (config.useKeycloak) {
+	if (environmentMap["LIFERAY_PORT"].contains("-")) {
+		throw new GradleException("Detected port range for Liferay. Please provide a single port for Liferay when using keycloak.")
+	}
+
+	if (environmentMap["KEYCLOAK_PORT"].contains("-")) {
+		throw new GradleException("Detected port range for Keycloak. Please provide a single port for Keycloak.")
+	}
+}
+
+config.serviceVersions.each {
+	String name, String version ->
+
+	if (config.services.contains(name)) {
+		environmentMap.put("${name.toUpperCase()}_VERSION", version)
+	}
 }
 
 file('.env').withOutputStream {

@@ -13,11 +13,21 @@ project.plugins.apply "docker-common"
 configurations {
 	db2
 	sqlserver
+	xerces
+	xuggler
 }
 
 dependencies {
 	db2 group: "com.ibm.db2.jcc", name: "db2jcc", version: "db2jcc4"
 	sqlserver group: "com.microsoft.sqlserver", name: "mssql-jdbc", version: "12.10.1.jre11"
+	xerces group: "xerces", name: "xercesImpl", version: "2.12.2"
+	xuggler group: "xuggle", name: "xuggle-xuggler", version: "5.4"
+}
+
+repositories {
+	maven {
+		url "https://maven.dcm4che.org/"
+	}
 }
 
 Closure<Boolean> isValidLicenseFile = {
@@ -112,33 +122,52 @@ Closure<FileCollection> copyLiferayLicenseFromDXPImage = {
 		return null
 	}
 
-	String latestImageName = getLatestImageNameLocal(imageName)
-
-	if (latestImageName == null) {
-		if (!pullImage) {
-			return null
-		}
-
+	if (pullImage) {
 		println "Checking image ${imageName} for a valid license file to copy, retrieving via docker pull (this may take awhile)"
 
-		waitForCommand("docker pull ${imageName}", null, System.out)
-
-		latestImageName = getLatestImageNameLocal(imageName)
-
-		if (latestImageName == null) {
-			return null
+		try {
+			waitForCommand("docker pull ${imageName}", null, System.out)
+		}
+		catch (Exception exception) {
+			logger.warn("Unable to pull ${imageName}")
 		}
 	}
 
+	String latestImageName = getLatestImageNameLocal(imageName)
+
+	if (latestImageName == null) {
+		return null
+	}
+
 	String temporaryContainerName = "${config.namespace}-license-check"
-	String temporaryVolumeName = "${config.namespace}-license"
+	String temporaryDeployVolumeName = "${config.namespace}-license-deploy"
+	String temporaryModulesVolumeName = "${config.namespace}-license-modules"
 
 	println "Attempting to copy trial license from ${latestImageName}"
 
-	waitForCommand("docker create --name=${temporaryContainerName} --volume=${temporaryVolumeName}:/opt/liferay/deploy ${latestImageName}")
-	waitForCommand("docker run --rm -v ${temporaryVolumeName}:/source -v ./configs/common/osgi/modules/:/target alpine sh -c 'cp /source/trial-*.xml /target/'")
-	waitForCommand("docker rm ${temporaryContainerName}")
-	waitForCommand("docker volume rm ${config.namespace}-license")
+	waitForCommand("docker create --name=${temporaryContainerName} --volume=${temporaryDeployVolumeName}:/opt/liferay/deploy --volume=${temporaryModulesVolumeName}:/opt/liferay/osgi/modules ${latestImageName}")
+
+	File modulesDir = file("${rootProject.projectDir}/configs/common/osgi/modules")
+
+	ByteArrayOutputStream errorByteArrayOutputStream = new ByteArrayOutputStream();
+
+	try {
+		waitForCommand("docker run --rm -v ${temporaryDeployVolumeName}:/source/deploy -v ${temporaryModulesVolumeName}:/source/modules -v ${modulesDir.absolutePath}:/target alpine sh -c 'cp /source/*/trial-*.xml /target/'", null, null, errorByteArrayOutputStream)
+	}
+	catch (Exception exception) {
+		String stderrOutputString = errorByteArrayOutputStream.toString().trim()
+
+		if (stderrOutputString.contains("No such file or directory")) {
+			logger.warn("Unable to find license in /opt/liferay/deploy or /opt/liferay/osgi/modules from ${latestImageName}")
+		}
+		else {
+			logger.warn(stderrOutputString)
+		}
+	}
+	finally {
+		waitForCommand("docker rm ${temporaryContainerName}")
+		waitForCommand("docker volume rm ${temporaryDeployVolumeName} ${temporaryModulesVolumeName}")
+	}
 
 	return project.fileTree("configs") {
 		include "**/osgi/modules/*.xml"
@@ -162,24 +191,24 @@ tasks.register("checkForLiferayLicense") {
 			isValidLicenseFile(it)
 		}
 
-		if (Util.isEmpty(licenseXmlFileCollection)) {
-			licenseXmlFileCollection = copyLiferayLicenseFromDXPImage(project.gradle.liferayWorkspace.dockerImageLiferay)
+		List<String> liferayLicenseCheckImages = [project.gradle.liferayWorkspace.dockerImageLiferay, "liferay/dxp:*.q*", "liferay/dxp:latest"]
+
+		String liferayLicenseCheckImagesProperty = project.findProperty("liferay.license.check.images")
+
+		if (liferayLicenseCheckImagesProperty != null) {
+			liferayLicenseCheckImages = liferayLicenseCheckImagesProperty.split(",")
 		}
 
-		if (Util.isEmpty(licenseXmlFileCollection)) {
-			licenseXmlFileCollection = copyLiferayLicenseFromDXPImage("liferay/dxp:*.q*")
+		for (image in liferayLicenseCheckImages) {
+			if (Util.isEmpty(licenseXmlFileCollection)) {
+				licenseXmlFileCollection = copyLiferayLicenseFromDXPImage(image)
+			}
 		}
 
-		if (Util.isEmpty(licenseXmlFileCollection)) {
-			licenseXmlFileCollection = copyLiferayLicenseFromDXPImage("liferay/dxp:latest")
-		}
-
-		if (Util.isEmpty(licenseXmlFileCollection)) {
-			licenseXmlFileCollection = copyLiferayLicenseFromDXPImage(project.gradle.liferayWorkspace.dockerImageLiferay, true)
-		}
-
-		if (Util.isEmpty(licenseXmlFileCollection)) {
-			licenseXmlFileCollection = copyLiferayLicenseFromDXPImage("liferay/dxp:latest", true)
+		for (image in liferayLicenseCheckImages) {
+			if (Util.isEmpty(licenseXmlFileCollection) && !image.contains("*")) {
+				licenseXmlFileCollection = copyLiferayLicenseFromDXPImage(image, true)
+			}
 		}
 
 		if (Util.isEmpty(licenseXmlFileCollection)) {
@@ -192,7 +221,7 @@ tasks.register("checkForLiferayLicense") {
 	}
 }
 
-Configuration dbDriverConfiguration = configurations.findByName(config.databaseType)
+Configuration dbDriverConfiguration = configurations.findByName(config.databaseDriverName)
 
 tasks.register("prepareJDBCDriver", Copy) {
 	onlyIf("using the Liferay service") {
@@ -205,7 +234,38 @@ tasks.register("prepareJDBCDriver", Copy) {
 	from {
 		dbDriverConfiguration
 	}
+
 	into "configs/common/tomcat/webapps/ROOT/WEB-INF/shielded-container-lib"
+}
+
+tasks.register("prepareSAXParser", Copy) {
+	onlyIf("using the Liferay service") {
+		config.useLiferay
+	}
+	onlyIf("using Amazon S3 store") {
+		config.dlStore == "s3"
+	}
+
+	from configurations.xerces
+
+	into "configs/common/tomcat/webapps/ROOT/WEB-INF/shielded-container-lib"
+}
+
+tasks.register("prepareXugglerJar", Copy) {
+	onlyIf("using the Liferay service") {
+		config.useLiferay
+	}
+	onlyIf("media preview is enabled") {
+		config.mediaPreviewEnabled
+	}
+	onlyIf("specifying a workspace product version for Liferay 7.3 or older") {
+		!config.is74OrQuarterly
+	}
+
+	from {
+		configurations.findByName("xuggler")
+	}
+	into "configs/common/tomcat/webapps/ROOT/WEB-INF/lib"
 }
 
 tasks.register("validateHotfixURLs") {
@@ -227,7 +287,7 @@ tasks.register("validateHotfixURLs") {
 		String mismatchedHotfixURL = config.hotfixURLs.find {
 			String hotfixURL ->
 
-			!hotfixURL.contains("/${liferayVersion}/")
+			!(hotfixURL.contains(liferayVersion) || hotfixURL.contains("/${liferayVersion}/"))
 		}
 
 		if (mismatchedHotfixURL != null) {
@@ -403,7 +463,10 @@ tasks.register("printBundleInfo", Exec) {
 	}
 
 	environment("LIFERAY_PRODUCT", config.dockerImageLiferayDXP ? "dxp" : "portal")
-	environment("LIFERAY_VERSION", gradle.liferayWorkspace.targetPlatformVersion)
+
+	if (!config.isNightly) {
+		environment("LIFERAY_VERSION", gradle.liferayWorkspace.targetPlatformVersion)
+	}
 
 	executable project.file("scripts/print_bundle_info.sh")
 }
@@ -428,9 +491,9 @@ tasks.register("prepareYourKitAgent", Copy) {
 	dependsOn ":downloadYourKitAgentZip"
 
 	eachFile {
-		File file ->
+		FileCopyDetails fileCopyDetails ->
 
-		file.relativePath = RelativePath.parse(true, file.name)
+		fileCopyDetails.relativePath = RelativePath.parse(true, fileCopyDetails.name)
 	}
 
 	from zipTree(downloadYourKitAgentZip.dest)

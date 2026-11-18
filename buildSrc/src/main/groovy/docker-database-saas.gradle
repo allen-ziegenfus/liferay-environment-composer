@@ -11,7 +11,58 @@ import java.util.regex.Pattern
 ext {
 	FALSE_SQL_VALUE = config.useDatabaseSQLServer ? "'false'" : "false"
 	SSO_CONFIGS = [".ldap.", ".multi.factor.authentication.", ".saml.", ".openid."]
-	PROD_ONLY_CONFIGS = [".liferay.analytics.", ".captcha.", ".content.security.policy.", ".elasticsearch7.", ".k8s."]
+	PROD_ONLY_CONFIGS = [".liferay.analytics.", ".captcha.", ".content.security.policy.", ".elasticsearch7.", ".elasticsearch8.", ".k8s."]
+
+	addCloudSQLScriptToDumpsVolume = {
+		File globalVariableScript = file("100_prepare_database_import.sql")
+
+		if (config.useDatabaseMySQL) {
+			Map<String, String> newVariables = [
+				"max_allowed_packet": String.valueOf(1L << 30),
+				"autocommit": "0",
+				"unique_checks": "0",
+				"foreign_key_checks": "0",
+				"innodb_stats_auto_recalc": "0",
+			]
+
+			globalVariableScript.withOutputStream {
+				BufferedOutputStream initSQLOutputStream ->
+
+				initSQLOutputStream << newVariables.collect {
+					Map.Entry<String, String> entry ->
+
+					"SET GLOBAL ${entry.key}=${entry.value};"
+				}.join("\n") << ";"
+
+				initSQLOutputStream << ["lportal", "dxpcloud", "cloudsqlimport"].collect {
+					String userName ->
+
+					"create user if not exists ${userName} identified by 'lportal';\ngrant all on *.* to '${userName}'@'%';\n"
+				}.join("\n")
+			}
+		}
+		else {
+			globalVariableScript.withOutputStream {
+				BufferedOutputStream initSQLOutputStream ->
+
+				initSQLOutputStream << "create role cloudsqlsuperuser with login superuser password 'lportal';"
+			}
+		}
+
+		addToVolume("${config.namespace}_dumps", globalVariableScript)
+
+		delete(globalVariableScript)
+	}
+
+	addGrantAdminAccessScriptToDumpsVolume = {
+		File grantAdminAccessSqlScript = file("050_grant_admin_access.sql")
+
+		grantAdminAccessSqlScript.text = "grant all privileges on *.* to '${config.databaseUser}'@'%';\nflush privileges;\n"
+
+		addToVolume("${config.namespace}_dumps", grantAdminAccessSqlScript)
+
+		delete(grantAdminAccessSqlScript)
+	}
 
 	clearSingleSignOnConfigurations = {
 		String schema ->
@@ -24,6 +75,30 @@ ext {
 		truncateTables('Saml%', schema)
 
 		println "Deleted known problematic single sign on entries from schema ${schema}"
+	}
+
+	copyDumpsFilesToDumpsVolume = {
+		FileCollection dumpFiles = project.fileTree("dumps").filter(
+			file -> file.name.toString() != ".gitkeep"
+		)
+
+		if (dumpFiles.files.size() > 1) {
+			throw new GradleException("failed to prepare dumps volume as multiple files were found in dumps directory")
+		}
+
+		String dumpsVolumeName = "${config.namespace}_dumps"
+
+		if (getExistingVolumeNames().contains(dumpsVolumeName)) {
+			waitForCommand("docker compose down database")
+			waitForCommand("docker volume rm ${dumpsVolumeName}")
+		}
+
+		waitForCommand("docker compose build database")
+		waitForCommand("docker compose create database")
+
+		println "Copying database dump file into dumps volume"
+
+		addToVolume(dumpsVolumeName, dumpFiles.getSingleFile())
 	}
 
 	copyLiferayLXCRepositoryConfiguration = {
@@ -60,9 +135,9 @@ ext {
 			return
 		}
 
-		File lcpJsonFile = new File(config.lxcRepositoryPath, "liferay/LCP.json")
+		File liferayLCPJsonFile = new File(config.lxcRepositoryPath, "liferay/LCP.json")
 
-		if (!lcpJsonFile.exists()) {
+		if (!liferayLCPJsonFile.exists()) {
 			println "Unable to copy configurations from LXC repository, because ${config.lxcRepositoryPath} is not the liferay-lxc repository"
 
 			return
@@ -123,7 +198,7 @@ ext {
 
 		JsonSlurper jsonSlurper = new JsonSlurper()
 
-		Map<String, String> environmentVariables = jsonSlurper.parse(lcpJsonFile)["environments"][config.lxcEnvironmentName]["env"]
+		Map<String, String> environmentVariables = jsonSlurper.parse(liferayLCPJsonFile)["environments"][config.lxcEnvironmentName]["env"]
 
 		String jdbcURL = environmentVariables["LIFERAY_JDBC_PERIOD_DEFAULT_PERIOD_URL"]
 
@@ -176,12 +251,96 @@ ext {
 			}
 		}
 
+		File searchLCPJsonFile = new File(config.lxcRepositoryPath, "search/LCP.json")
+
+		String searchImage = jsonSlurper.parse(searchLCPJsonFile).image
+
+		Map<String, String> elasticsearchProperties = [
+			"lr.docker.environment.service.enabled[elasticsearch]": "true"
+		]
+
+		if (searchImage.contains(":")) {
+			elasticsearchProperties["lr.docker.environment.service.version[elasticsearch]"] = searchImage.split(":")[1].split("-")[0]
+		}
+		else {
+			println "Unable to read a version from the image ${searchImage} in ${searchLCPJsonFile}, defaulting to Elasticsearch version ${config.serviceVersions["elasticsearch"]}"
+		}
+
+		updateGradleLocalProperties(elasticsearchProperties)
+
 		String latestReleaseInfoDate = updateGradlePropertiesWithLiferayVersion()
 
 		if (latestReleaseInfoDate != null) {
 			println ""
 			println "Updated gradle-local.properties to environment dated ${latestReleaseInfoDate}"
 		}
+	}
+
+	decompressArchiveFilesInDumpsVolume = {
+		String dumpsVolumeName = "${config.namespace}_dumps"
+		String userString = config.useDatabaseSQLServer ? "--user 10001:10001" : ""
+
+		List<String> dumpFiles = waitForCommand("docker run --rm ${userString} -v ${dumpsVolumeName}:/target busybox:latest ls /target").split(/\n/)
+
+		List<File> archiveFiles = dumpFiles.findAll {
+			file -> file.matches(/.*\.(gz|tar\.gz|tgz|bz2|tar\.bz2|tbz|zip|7z)/)
+		}
+
+		if (archiveFiles.size() == 0) {
+			return
+		}
+
+		String archiveFileName = archiveFiles[0]
+
+		String withDecryption = ""
+
+		if (archiveFileName.endsWith("zip") || archiveFileName.endsWith("7z")) {
+			boolean isEncrypted = waitForCommand("docker run --rm ${userString} -v ${dumpsVolumeName}:/target backplane/7z:latest l -slt /target/${archiveFileName}").contains("Encrypted = +")
+
+			String lxcBackupPassword = ""
+
+			if (isEncrypted) {
+				if (!config.lxcBackupPassword) {
+					throw new GradleException("failed to decrypt archive as no LXC backup password was provided")
+				}
+
+				lxcBackupPassword = config.lxcBackupPassword
+
+				withDecryption = "with decryption"
+			}
+
+			println "Decompressing database archive file into dumps volume ${withDecryption}"
+
+			waitForCommand("docker run --rm ${userString} -v ${dumpsVolumeName}:/target backplane/7z:latest x -aos /target/${archiveFileName} -o/target -p${lxcBackupPassword}")
+		}
+
+		String busyboxCommand = ""
+
+		if (archiveFileName.endsWith("tar.gz") || archiveFileName.endsWith("tgz")) {
+			busyboxCommand = "tar xzf /target/${archiveFileName} -C /target"
+		}
+		else if (archiveFileName.endsWith("gz")) {
+			busyboxCommand = "gzip -d /target/${archiveFileName}"
+		}
+
+		if (archiveFileName.endsWith("tar.bz2") || archiveFileName.endsWith("tbz")) {
+			busyboxCommand = "tar xjf /target/${archiveFileName} -C /target"
+		}
+		else if (archiveFileName.endsWith("bz2")) {
+			busyboxCommand = "bzip2 -d /target/${archiveFileName}"
+		}
+
+		if (archiveFileName.endsWith("tar")) {
+			busyboxCommand = "tar xf /target/${archiveFileName} -C /target"
+		}
+
+		if (busyboxCommand != "") {
+			waitForCommand("docker run --rm ${userString} -v ${dumpsVolumeName}:/target busybox:latest sh -c '${busyboxCommand}'")
+		}
+
+		waitForCommand("docker run --rm ${userString} -v ${dumpsVolumeName}:/target busybox:latest sh -c 'rm -rf /target/${archiveFileName}'")
+
+		waitForContainer("database")
 	}
 
 	deleteMeantForProductionOnlyConfigurations = {
@@ -249,6 +408,35 @@ ext {
 		return releaseInfo
 	}
 
+	importPostgreSQLBinaryDump = {
+		waitForContainer("database")
+
+		List<String> backupFileNames = waitForCommand("docker compose exec database ls /docker-entrypoint-initdb.d").split(/\n/)
+
+		List<String> binaryDumpFileNames = backupFileNames.findAll {
+			fileName -> [".bak", ".dmp", ".dump", ".pg"].any {
+				extension -> fileName.endsWith(extension)
+			}
+
+		}
+
+		if (binaryDumpFileNames.size() > 1) {
+			throw new GradleException("Aborting because multiple binary dump files were found in the dumps folder.")
+		}
+
+		if (binaryDumpFileNames.size() > 0) {
+			String databaseInitialized = executeSQLQuery("SELECT * from pg_tables WHERE schemaname NOT LIKE 'pg_%' AND schemaname NOT LIKE 'sql_%' AND schemaname NOT LIKE 'information_schema'")
+
+			if (databaseInitialized.trim() == "[]") {
+				println "Attempting to restore binary dump file: ${binaryDumpFileNames[0]} with database name: ${config.databaseName}..."
+
+				waitForCommand("docker compose exec -u postgres database pg_restore -v -O -x -U ${config.databaseUser} -d ${config.databaseName} /docker-entrypoint-initdb.d/${binaryDumpFileNames[0]}")
+			} else {
+				println "Database ${config.databaseName} already initialized, skipping dump binary restore."
+			}
+		}
+	}
+
 	reactivateDisabledUsers = {
 		String schema ->
 
@@ -265,6 +453,26 @@ ext {
 		executeSQLQuery("update User_ set password_ = '${config.liferayUserPassword}', passwordEncrypted = false, passwordReset = false, lockout = false", schema)
 
 		println "Reset all user passwords to '${config.liferayUserPassword}' in schema ${schema}"
+	}
+
+	resetDatabaseGlobalValues = {
+		println "resetting global global values for ${config.databaseType}"
+
+		Map<String, String> oldVariables = [
+			"max_allowed_packet": String.valueOf(1L << 26),
+			"autocommit": "1",
+			"unique_checks": "1",
+			"foreign_key_checks": "1",
+			"innodb_stats_auto_recalc": "1",
+		]
+
+		String query = oldVariables.collect {
+			Map.Entry<String, String> oldVariable ->
+
+			"SET GLOBAL ${oldVariable.key}=${oldVariable.value};\n"
+		}.join("")
+
+		executeSQLQuery(query)
 	}
 
 	sanitizeMailConfigurations = {
@@ -318,8 +526,8 @@ ext {
 	}
 
 	updateDatabaseForLocalDevelopment = {
-		forEachCompanyId {
-			String companyId, String hostname, String webId, String schema ->
+		Closure sanitizeSchema = {
+			String schema ->
 
 			replaceUserPasswords(schema)
 			clearSingleSignOnConfigurations(schema)
@@ -327,6 +535,17 @@ ext {
 			disableUserObjectValidations(schema)
 			sanitizeMailConfigurations(schema)
 			deleteMeantForProductionOnlyConfigurations(schema)
+		}
+
+		if (config.databasePartitioningEnabled)	{
+			forEachCompanyId {
+				String companyId, String hostname, String webId, String schema ->
+
+				sanitizeSchema(schema)
+			}
+		}
+		else {
+			sanitizeSchema(config.databaseName)
 		}
 
 		updateVirtualHosts()
@@ -358,15 +577,20 @@ ext {
 			println ""
 			println releaseInfoDate
 
-			Map<String, String> releaseInfo = getReleaseInfo(waitForCommand("git show ${commit}:${descriptorPath}", lxcRepositoryFolder)).each {
-				Map.Entry<String, String> entry ->
+			try {
+				Map<String, String> releaseInfo = getReleaseInfo(waitForCommand("git show ${commit}:${descriptorPath}", lxcRepositoryFolder)).each {
+					Map.Entry<String, String> entry ->
 
-				println entry
+					println entry
+				}
+
+				if (latestReleaseInfo == null) {
+					latestReleaseInfo = releaseInfo
+					latestReleaseInfoDate = releaseInfoDate
+				}
 			}
-
-			if (latestReleaseInfo == null) {
-				latestReleaseInfo = releaseInfo
-				latestReleaseInfoDate = releaseInfoDate
+			catch (Exception exception) {
+				println "Could not find file ${descriptorPath} at commit ${commit}, trying next..."
 			}
 		}
 
@@ -413,6 +637,8 @@ ext {
 	updateVirtualHosts = {
 		executeSQLQuery("update VirtualHost set hostname = concat(hostname, '.localhost') where hostname <> 'localhost' and hostname not like '%.localhost'", config.databaseName)
 
+		config.companyVirtualHosts = null
+
 		println "Added .localhost to the end of all virtual host names that were not localhost"
 	}
 }
@@ -425,222 +651,37 @@ tasks.register("copyLiferayLXCRepositoryConfigurations") {
 	}
 }
 
-tasks.register("decryptCloudBackupDatabase") {
-	onlyIf("using an external database") {
-		config.useDatabase
-	}
-	onlyIf("there is a database dump file") {
-		!Util.isEmpty(project.fileTree("dumps"))
-	}
-
-	doFirst {
-		FileCollection decryptedBackups = project.fileTree("dumps") {
-			include "**/*.sql"
-			include "**/*.sql.gz"
-			include "**/*.gz"
-		}
-
-		if (!Util.isEmpty(decryptedBackups)) {
-			print("Found existing unencrypted backups in dumps/ folder")
-
-			return
-		}
-
-		FileCollection encryptedBackups = project.fileTree("dumps") {
-			include "*.7z"
-			exclude "*doclib*"
-		}
-
-		if (Util.isEmpty(encryptedBackups)) {
-			encryptedBackups = project.fileTree("dumps") {
-				include "*.zip"
-				exclude "*doclib*"
-			}
-		}
-
-		if (encryptedBackups.isEmpty()) {
-			return
-		}
-		else if (encryptedBackups.size() != 1) {
-			throw new GradleException("Aborting because multiple potential backups where found in the dumps/ folder")
-		}
-
-		if (config.lxcBackupPassword != null && config.lxcBackupPassword.length() > 0) {
-			println "Extracting LXC database backup (using password specified in gradle.properties)"
-
-			waitForCommand("7z x -aos ${encryptedBackups[0].absolutePath} -odumps/ -p${config.lxcBackupPassword}")
-		}
-		else {
-			println "Extracting LXC database backup (assuming no password, because none was set in gradle.properties)"
-
-			waitForCommand("7z x -aos ${encryptedBackups[0].absolutePath} -odumps/ -p")
-		}
-	}
-}
-
-tasks.register("copyDatabaseDumpsToDumpsVolume") {
-	dependsOn ":decryptCloudBackupDatabase"
-
-	onlyIf("using an external database") {
-		config.useDatabase
-	}
-	onlyIf("there is a database dump file") {
-		!Util.isEmpty(project.fileTree("dumps"))
-	}
-
-	doFirst {
-		FileCollection backupFiles = project.fileTree(config.dataDirectory)
-
-		if (config.dataDirectory != null && !config.dataDirectory.isEmpty() && !Util.isEmpty(backupFiles)) {
-			return;
-		}
-
-		String dumpsVolumeName = "${config.namespace}_dumps"
-
-		if (getExistingVolumeNames().contains(dumpsVolumeName)) {
-			waitForCommand("docker compose down database")
-			waitForCommand("docker volume rm ${dumpsVolumeName}")
-		}
-
-		waitForCommand("docker compose build database")
-		waitForCommand("docker compose create database")
-
-		fileTree("dumps") {
-			include "**/*"
-			exclude "**/.gitkeep"
-		}.forEach {
-			File dumpFile ->
-
-			println dumpFile
-
-			if (config.useDatabaseMariaDB || config.useDatabaseMySQL || config.useDatabasePostgreSQL) {
-				String oldPath = dumpFile.absolutePath
-				String newPath = null
-
-				if (dumpFile.name.endsWith(".gz") && !dumpFile.name.endsWith(".sql.gz")) {
-					newPath = "${oldPath.substring(0, oldPath.length() - 3)}.sql.gz"
-				}
-				else if (!dumpFile.name.contains(".")) {
-					newPath = "${dumpFile.absolutePath}.sql"
-				}
-
-				if (newPath != null) {
-					dumpFile.renameTo(newPath)
-					dumpFile = file(newPath)
-				}
-			}
-
-			addToVolume(dumpsVolumeName, dumpFile)
-		}
-
-		println "Loading database backup into database dumps volume"
-
-		File globalVariableScript = file("0.sql")
-
-		if (config.useDatabaseMySQL) {
-			Map<String, String> newVariables = [
-				"max_allowed_packet": String.valueOf(1L << 30),
-				"autocommit": "0",
-				"unique_checks": "0",
-				"foreign_key_checks": "0",
-				"innodb_stats_auto_recalc": "0",
-			]
-
-			globalVariableScript.withOutputStream {
-				BufferedOutputStream initSQLOutputStream ->
-
-				initSQLOutputStream << newVariables.collect {
-					Map.Entry<String, String> entry ->
-
-					"SET GLOBAL ${entry.key}=${entry.value};"
-				}.join("\n") << ";"
-
-				initSQLOutputStream << ["lportal", "dxpcloud", "cloudsqlimport"].collect {
-					String userName ->
-
-					"create user if not exists ${userName} identified by 'lportal';\ngrant all on *.* to '${userName}'@'%';\n"
-				}.join("\n")
-			}
-		}
-		else if (config.useDatabasePostgreSQL) {
-			globalVariableScript.withOutputStream {
-				BufferedOutputStream initSQLOutputStream ->
-
-				initSQLOutputStream << "create role cloudsqlsuperuser with login superuser password 'lportal';"
-			}
-		}
-
-		if (globalVariableScript.exists()) {
-			addToVolume(dumpsVolumeName, globalVariableScript)
-
-			globalVariableScript.delete()
-		}
-	}
-}
-
 tasks.register("importDatabaseDumps") {
-	dependsOn ":copyDatabaseDumpsToDumpsVolume"
-
 	onlyIf("using an external database") {
 		config.useDatabase
 	}
 	onlyIf("there is a database dump file") {
 		!Util.isEmpty(project.fileTree("dumps"))
 	}
+	onlyIf("the data directory is empty") {
+		Util.isEmpty(project.fileTree(config.dataDirectory))
+	}
 
 	doFirst {
-		FileCollection backupFiles = project.fileTree(config.dataDirectory)
+		copyDumpsFilesToDumpsVolume()
 
-		if (config.dataDirectory != null && !config.dataDirectory.isEmpty() && !Util.isEmpty(backupFiles)) {
-			println "Skipping database dumps import because a data backup will be imported from ${config.dataDirectory}"
-
-			return;
+		if (config.useDatabaseMariaDB || config.useDatabaseMySQL) {
+			addGrantAdminAccessScriptToDumpsVolume()
 		}
 
-		println "Initializing database via first start scripts"
-
-		waitForContainer("database")
-
-		if (config.useDatabaseMySQL) {
-			Map<String, String> oldVariables = [
-				"max_allowed_packet": String.valueOf(1L << 26),
-				"autocommit": "1",
-				"unique_checks": "1",
-				"foreign_key_checks": "1",
-				"innodb_stats_auto_recalc": "1",
-			]
-
-			String query = oldVariables.collect {
-				Map.Entry<String, String> oldVariable ->
-
-				"SET GLOBAL ${oldVariable.key}=${oldVariable.value};\n"
-			}.join("")
-
-			executeSQLQuery(query)
+		if (config.useDatabaseMySQL || config.useDatabasePostgreSQL) {
+			addCloudSQLScriptToDumpsVolume()
 		}
 
-		FileCollection binaryDumpFiles = project.fileTree("dumps") {
-			include "**/*.dmp"
-			include "**/*.dump"
+		decompressArchiveFilesInDumpsVolume()
+
+		if (config.useDatabaseMariaDB || config.useDatabaseMySQL) {
+			resetDatabaseGlobalValues()
 		}
 
-		if (config.useDatabasePostgreSQL && !Util.isEmpty(binaryDumpFiles)) {
-			if (binaryDumpFiles.size() > 1) {
-				throw new GradleException("Aborting because multiple binary dump files were found in the dumps folder.")
-			}
-
-			String databaseInitialized = executeSQLQuery("SELECT * from pg_tables WHERE schemaname NOT LIKE 'pg_%' AND schemaname NOT LIKE 'sql_%' AND schemaname NOT LIKE 'information_schema'")
-
-			if (databaseInitialized.trim() == "[]") {
-				println "Attempting to restore binary dump file: ${binaryDumpFiles[0].name} with database name: ${config.databaseName}..."
-
-				waitForCommand("docker compose exec -u postgres database pg_restore -v -U liferay -d ${config.databaseName} /docker-entrypoint-initdb.d/${binaryDumpFiles[0].name}")
-			} else {
-				println "Database ${config.databaseName} already initialized, skipping dump binary restore."
-			}
+		if (config.useDatabasePostgreSQL) {
+			importPostgreSQLBinaryDump()
 		}
-
-		println "Attempting to update database for local development"
 
 		updateDatabaseForLocalDevelopment()
 	}

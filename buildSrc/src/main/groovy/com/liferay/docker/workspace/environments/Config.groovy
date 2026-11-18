@@ -22,9 +22,13 @@ class Config {
 			this.clusterNodes = clusterNodesProperty
 		}
 
-		this.composeFiles.add("docker-compose.yaml")
+		String clusterUnicastEnabledProperty = project.findProperty("lr.docker.environment.cluster.unicast.enabled")
 
-		this.composeFiles.addAll(this.toList(project.findProperty("lr.docker.environment.compose.files")))
+		if (clusterUnicastEnabledProperty != null) {
+			this.clusterUnicastEnabled = clusterUnicastEnabledProperty.toBoolean()
+		}
+
+		this.composeFiles.add("docker-compose.yaml")
 
 		String clearVolumeData = project.findProperty("lr.docker.environment.clear.volume.data")
 
@@ -36,6 +40,18 @@ class Config {
 
 		if (databaseNameProperty != null) {
 			this.databaseName = databaseNameProperty
+		}
+
+		String databasePasswordProperty = project.findProperty("lr.docker.environment.database.password")
+
+		if (databasePasswordProperty != null) {
+			this.databasePassword = databasePasswordProperty
+		}
+
+		String databaseUserProperty = project.findProperty("lr.docker.environment.database.user")
+
+		if (databaseUserProperty != null) {
+			this.databaseUser = databaseUserProperty
 		}
 
 		String databasePartitioningEnabledProperty = project.findProperty("lr.docker.environment.database.partitioning.enabled")
@@ -88,6 +104,37 @@ class Config {
 
 		if (dataDirectoryProperty != null && dataDirectory.length() > 0) {
 			this.dataDirectory = dataDirectoryProperty
+		}
+
+		String dlStoreProperty = project.findProperty("lr.docker.environment.dl.store")
+
+		if (dlStoreProperty != null && !dlStoreProperty.isEmpty()) {
+			this.dlStore = dlStoreProperty
+		}
+
+		Map<String, String> dlStoreClassMap = [
+			"advanced": "com.liferay.portal.store.file.system.AdvancedFileSystemStore",
+			"db": "com.liferay.portal.store.db.DBStore",
+			"s3": "com.liferay.portal.store.s3.S3Store",
+			"simple": "com.liferay.portal.store.file.system.FileSystemStore"
+		]
+
+		this.dlStoreClass = dlStoreClassMap[this.dlStore]
+
+		if (this.dlStoreClass == null) {
+			throw new GradleException("${dlStore} is not a valid DLStore type. Valid types are: ${dlStoreClassMap.collect {it.key}}")
+		}
+
+		if (this.dlStore == "advanced") {
+			this.dlStorePath = getRequiredProperty(project, "lr.docker.environment.dl.store.path")
+		}
+
+		if (this.dlStore == "s3") {
+			this.s3AccessKey = getRequiredProperty(project, "lr.docker.environment.s3.access.key")
+			this.s3BucketName = getRequiredProperty(project, "lr.docker.environment.s3.bucket.name")
+			this.s3Endpoint = project.findProperty("lr.docker.environment.s3.endpoint")
+			this.s3Region = getRequiredProperty(project, "lr.docker.environment.s3.region")
+			this.s3SecretKey = getRequiredProperty(project, "lr.docker.environment.s3.secret.key")
 		}
 
 		String glowrootEnabledProperty = project.findProperty("lr.docker.environment.glowroot.enabled")
@@ -159,12 +206,38 @@ class Config {
 			this.dockerImageLiferayDXP = true
 		}
 
+		if (this.dockerImageLiferay.contains("nightly")) {
+			this.isNightly = true
+		}
+
 		this.liferayDockerImageId = "${this.namespace}-liferay"
 
-		def webserverHostnamesProperty = project.findProperty("lr.docker.environment.web.server.hostnames").split(',')*.trim().findAll { it }
+		String recaptchaEnabledProperty = project.findProperty("lr.docker.environment.recaptcha.enabled")
 
-		if (webserverHostnamesProperty != null) {
+		if (recaptchaEnabledProperty != null) {
+			this.recaptchaEnabled = recaptchaEnabledProperty.toBoolean()
+		}
+
+		def webserverHostnamesProperty = project.findProperty("lr.docker.environment.web.server.hostnames")?.split(',')*.trim()?.findAll { it }
+
+		if (webserverHostnamesProperty) {
 			this.webserverHostnames = webserverHostnamesProperty.join(' ')
+		}
+
+		String webserverModSecurityEnabledProperty = project.findProperty("lr.docker.environment.web.server.modsecurity.enabled")
+
+		if (webserverModSecurityEnabledProperty != null) {
+			this.modSecurityEnabled = webserverModSecurityEnabledProperty.toBoolean()
+		}
+
+		String webserverProtocolProperty = project.findProperty("lr.docker.environment.web.server.protocol")
+
+		if (webserverProtocolProperty != null) {
+			if (!(webserverProtocolProperty == "http" || webserverProtocolProperty == "https")) {
+				throw new GradleException("Please set \"lr.docker.environment.web.server.protocol\" as either \"http\" or \"https\".")
+			}
+
+			this.webserverProtocol = webserverProtocolProperty
 		}
 
 		String yourKitEnabledProperty = project.findProperty("lr.docker.environment.yourkit.enabled")
@@ -179,9 +252,21 @@ class Config {
 			this.yourKitUrl = yourKitUrlProperty
 		}
 
+		String mediaPreviewEnabledProperty = project.findProperty("lr.docker.environment.media.preview.enabled")
+
+		if (mediaPreviewEnabledProperty != null) {
+			this.mediaPreviewEnabled = mediaPreviewEnabledProperty
+		}
+
+		this.useKeycloak = this.services.contains("keycloak")
+
 		this.useLiferay = this.services.contains("liferay")
 
 		this.useClustering = this.useLiferay && this.clusterNodes > 0
+
+		if (this.useKeycloak && this.useClustering) {
+			throw new GradleException("This configuration is currently not supported. Please disable keycloak to continue using Liferay with clustering, or disable clustering in order to continue using Keycloak.")
+		}
 
 		if (this.services.contains("db2")) {
 			this.databaseType = "db2"
@@ -213,13 +298,65 @@ class Config {
 			this.useDatabaseSQLServer = true
 		}
 
-		if (this.services.contains("webserver_http") && this.services.contains("webserver_https")) {
-			throw new GradleException("Both HTTP and HTTPS are enabled for the webserver service. Only one protocol can be active at a time.")
+		if (this.useDatabase) {
+			this.databaseDriverName = this.databaseType
+		} else {
+			Properties portalExtProperties = new Properties()
+
+			project.fileTree("configs/common/") {
+				include "*.properties"
+				include "**/*.properties"
+			}.files.forEach {
+				File file ->
+
+				file.withInputStream { portalExtProperties.load(it) }
+			}
+
+			def jdbcDriverClassName = portalExtProperties.get("jdbc.default.driverClassName")
+
+			if (jdbcDriverClassName == "com.ibm.db2.jcc.DB2Driver") {
+				this.databaseDriverName = "db2"
+			}
+
+			if (jdbcDriverClassName == "com.microsoft.sqlserver.jdbc.SQLServerDriver") {
+				this.databaseDriverName = "sqlserver"
+			}
 		}
 
-		this.useWebserverHttp = this.services.contains("webserver_http")
+		if (this.services.contains("webserver")) {
+			this.useWebserver = true
+		}
 
-		this.useWebserverHttps = this.services.contains("webserver_https")
+		project.properties.each {
+			String key, value ->
+
+			def matcher = key =~ /^lr\.docker\.environment\.service\.version\[(\w+)\]$/
+
+			if (matcher) {
+				this.serviceVersions[matcher[0][1]] = value
+			}
+		}
+
+		this.serviceVersions.each {
+			String name, String version ->
+
+			if (this.services.contains(name) && !version) {
+				throw new GradleException("Missing required property: lr.docker.environment.service.version[${name}]")
+			}
+		}
+
+		if (this.services.contains("elasticsearch")) {
+			String elasticsearchVersion = this.serviceVersions["elasticsearch"]
+			String elasticsearchServiceMajorVersion = elasticsearchVersion.split("\\.")[0]
+
+			if (!(elasticsearchServiceMajorVersion in ["7", "8"])) {
+				throw new GradleException("Unsupported Elasticsearch version: ${elasticsearchVersion}. Supported major versions: 7, 8.")
+			}
+		}
+
+		if (this.dockerImageLiferay.contains("7.4") || this.dockerImageLiferay.contains(".q")) {
+			this.is74OrQuarterly = true
+		}
 
 		File projectDir = project.projectDir as File
 		String[] databasePartitioningCompatibleServiceNames = ["mysql", "postgres"]
@@ -229,6 +366,10 @@ class Config {
 
 			if (useClustering) {
 				include "**/clustering.*.yaml"
+
+				if (this.clusterUnicastEnabled) {
+					include "**/unicast-clustering.liferay.yaml"
+				}
 			}
 
 			if (glowrootEnabled) {
@@ -239,6 +380,10 @@ class Config {
 				include "**/liferay.*.yaml"
 			}
 
+			if (recaptchaEnabled) {
+				include "**/recaptcha.*.yaml"
+			}
+
 			if (this.databasePartitioningEnabled) {
 				if (!this.services.any {databasePartitioningCompatibleServiceNames.contains(it)}) {
 					throw new GradleException("Database partitioning must be used with one of these databases: ${databasePartitioningCompatibleServiceNames}")
@@ -247,11 +392,30 @@ class Config {
 				include "**/database-partitioning.*.yaml"
 			}
 
+			if (this.dlStore) {
+				if (this.dlStore == "advanced") {
+					include "**/dlstore.liferay.yaml"
+				}
+
+				if (this.dlStore == "s3") {
+					include "**/s3store.liferay.yaml"
+				}
+			}
+
 			if (this.yourKitEnabled) {
 				include "**/yourkit.liferay.yaml"
 
 				if (useClustering) {
 					include "**/yourkit-clustering.liferay.yaml"
+				}
+			}
+
+			if (mediaPreviewEnabled) {
+				if (this.is74OrQuarterly) {
+					include "**/ffmpeg.liferay.yaml"
+				}
+				else {
+					include "**/xuggler.liferay.yaml"
 				}
 			}
 		}
@@ -278,14 +442,33 @@ class Config {
 					"The service '${serviceName}' does not have a matching service.*.yaml file. Possible services are: ${possibleServices}");
 			}
 
-			matchingFileTree.getFiles()
-		}.flatten().collect {
+			matchingFileTree.files.sort {
+				File composeFile ->
+
+				composeFile.name
+			}
+		}.flatten().sort {
+			File serviceComposeFile ->
+
+			serviceComposeFile.name.startsWith("service.") ? 0 : 1
+		}.collect {
 			File serviceComposeFile ->
 
 			projectDir.relativePath(serviceComposeFile)
 		}
 
 		this.composeFiles.addAll(serviceComposeFiles)
+
+		this.composeFiles.addAll(this.toList(project.findProperty("lr.docker.environment.compose.files")))
+	}
+
+	static Object getRequiredProperty(Project project, String property) {
+		try {
+			return project.getProperty(property)
+		}
+		catch (MissingPropertyException missingPropertyException) {
+			throw new GradleException("Missing required property: ${property}", missingPropertyException)
+		}
 	}
 
 	static List toList(String s) {
@@ -300,27 +483,45 @@ class Config {
 
 	public boolean clearVolumeData = false
 	public int clusterNodes = 0
+	public boolean clusterUnicastEnabled = false
 	public List<Map<String, String>> companyVirtualHosts = null
 	public List<String> composeFiles = new ArrayList<String>()
+	public String databaseDriverName = ""
 	public String databaseName = "lportal"
 	public String databaseType = ""
 	public boolean databasePartitioningEnabled = false
+	public String databasePassword = ""
+	public String databaseUser = ""
 	public String dataDirectory = "data"
 	public Map<String, String> defaultCompanyVirtualHost = null
+	public String dlStore = ""
+	public String dlStoreClass = ""
+	public String dlStorePath = null
 	public String dockerImageLiferay = null
 	public boolean dockerImageLiferayDXP = false
 	public List<String> gcpHotfixURLs = new ArrayList<String>()
 	public boolean glowrootEnabled = false
 	public List<String> hotfixURLs = new ArrayList<String>()
+	public boolean is74OrQuarterly = false
 	public boolean isARM = false
+	public boolean isNightly = false
 	public String liferayDockerImageId = ""
 	public String liferayUserPassword = "test"
 	public String lxcBackupPassword = null
 	public String lxcEnvironmentName = null
 	public String lxcRepositoryPath = null
+	public boolean mediaPreviewEnabled = false
+	public boolean modSecurityEnabled = false
 	public String namespace = null
 	public String product = null
+	public boolean recaptchaEnabled = false
+	public String s3AccessKey = null
+	public String s3BucketName = null
+	public String s3Endpoint = null
+	public String s3Region = null
+	public String s3SecretKey = null
 	public List<String> services = new ArrayList<String>()
+	public Map<String, String> serviceVersions = [:]
 	public boolean useClustering = false
 	public boolean useDatabase = false
 	public boolean useDatabaseDB2 = false
@@ -328,12 +529,13 @@ class Config {
 	public boolean useDatabaseMySQL = false
 	public boolean useDatabasePostgreSQL = false
 	public boolean useDatabaseSQLServer = false
+	public boolean useKeycloak = false
 	public boolean useLiferay = false
-	public boolean useWebserverHttp = false
-	public boolean useWebserverHttps = false
+	public boolean useWebserver = false
 	public String webserverHostnames = "localhost"
+	public String webserverProtocol = null
 	public boolean yourKitEnabled = false
-	public String yourKitUrl = "https://www.yourkit.com/download/docker/YourKit-JavaProfiler-2025.3-docker.zip"
+	public String yourKitUrl = "https://www.yourkit.com/download/docker/YourKit-JavaProfiler-2025.9-docker.zip"
 
 	@Override
 	public String toString() {

@@ -1,0 +1,97 @@
+#!/bin/bash
+
+_sqlcmd="/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P ${MSSQL_SA_PASSWORD}"
+
+_is_database_present() {
+	local database_name=${1}
+
+	${_sqlcmd} -Q "select name from sys.databases" | grep -q "${database_name}"
+}
+
+grant_liferay_access() {
+	local database_name=${1}
+
+	echo "[entrypoint] Ensuring login ${DATABASE_USER} has access to ${database_name}..."
+
+	${_sqlcmd} -Q "
+IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = '${DATABASE_USER}')
+	CREATE LOGIN [${DATABASE_USER}] WITH PASSWORD = '${DATABASE_PASSWORD}', CHECK_POLICY = OFF;
+"
+
+	${_sqlcmd} -d "${database_name}" -Q "
+IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = '${DATABASE_USER}')
+	CREATE USER [${DATABASE_USER}] FOR LOGIN [${DATABASE_USER}];
+ELSE
+	ALTER USER [${DATABASE_USER}] WITH LOGIN = [${DATABASE_USER}];
+IF IS_ROLEMEMBER('db_owner', '${DATABASE_USER}') = 0
+	ALTER ROLE db_owner ADD MEMBER [${DATABASE_USER}];
+"
+}
+
+create_database() {
+	local database_name=${1}
+
+	if _is_database_present "${database_name}"; then
+		echo "[entrypoint] Database ${database_name} is present; skipping database creation"
+
+		return
+	fi
+
+	local backup_file
+
+	backup_file=$(find /var/opt/mssql/backups -iname "*.bak" -or -iname "*.bacpac" | tail -n 1)
+
+	if [[ -f "${backup_file}" ]]; then
+		echo "[entrypoint] Database backup found; restoring database ${database_name}..."
+
+		if [[ "${backup_file}" =~ .*\.bak ]]; then
+			echo "[entrypoint] Found bak file"
+
+			sed -i "s,%DATABASE_NAME%,${database_name},g" /init/restore.sql
+
+			sed -i "s,%BACKUP_FILE%,${backup_file},g" /init/restore.sql
+
+			${_sqlcmd} -i /init/restore.sql
+
+			return
+		else
+			echo "[entrypoint] Found bacpac file"
+
+			sqlpackage /a:Import /sf:"${backup_file}" /tdn:"${database_name}" /tp:"${MSSQL_SA_PASSWORD}" /tsn:localhost /ttsc:true /tu:sa
+
+			return
+		fi
+	fi
+
+	echo "[entrypoint] Could not find database ${database_name}; creating database..."
+
+	sed -i "s,%DATABASE_NAME%,${database_name},g" /init/init.sql
+
+	${_sqlcmd} -i /init/init.sql
+}
+
+/opt/mssql/bin/sqlservr &
+PID=$!
+
+echo "[entrypoint] Waiting for SQL Server to boot..."
+until [[ -f /var/opt/mssql/log/errorlog ]]; do
+	sleep 1
+done
+
+until grep -q "SQL Server is now ready for client connections" /var/opt/mssql/log/errorlog; do
+	sleep 1
+done
+
+until [[ $(${_sqlcmd} -Q "select 1") ]]; do
+	sleep 1
+done
+
+echo "[entrypoint] SQLServer is available"
+
+create_database "${COMPOSER_DATABASE_NAME}"
+
+touch /tmp/database_exists
+
+grant_liferay_access "${COMPOSER_DATABASE_NAME}"
+
+wait $PID

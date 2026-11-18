@@ -1,0 +1,57 @@
+String keycloakDir = "compose-recipes/keycloak"
+
+String certFile = "${keycloakDir}/build/server.crt"
+String keyFile = "${keycloakDir}/build/server.key"
+String keystoreFile = "${keycloakDir}/build/keystore.p12"
+String opensslCnfFile = "${keycloakDir}/conf/openssl.cnf"
+
+tasks.register("prepareKeycloakSelfSignedCert", Exec) {
+	onlyIf("using keycloak") {
+		config.useKeycloak
+	}
+
+	inputs.file(opensslCnfFile)
+
+	outputs.files(
+		certFile,
+		keyFile
+	)
+
+	commandLine('openssl', 'req', '-x509',
+		'-nodes',
+		'-days', '365',
+		'-newkey', 'rsa:2048',
+		'-keyout', keyFile,
+		'-out', certFile,
+		'-config', opensslCnfFile)
+}
+
+tasks.register("prepareLiferayKeystoreFile", Exec) {
+	dependsOn ":prepareKeycloakSelfSignedCert"
+
+	onlyIf("using keycloak") {
+		config.useKeycloak
+	}
+
+	inputs.files(
+		certFile,
+		keyFile
+	)
+
+	outputs.file(keystoreFile)
+
+	commandLine('openssl', 'pkcs12', '-export',
+		'-in', certFile,
+		'-inkey', keyFile,
+		'-out', keystoreFile,
+		'-name', "liferay-alias",
+		'-passout', 'pass:')
+
+	doLast {
+		println "###############"
+		println ""
+		println "Generated keystore.p12 file path: ${keystoreFile}"
+		println ""
+		println "###############"
+	}
+}

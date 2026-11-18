@@ -17,6 +17,17 @@ ext {
 
 		String targetName = sourceFile.name
 
+		if (config.useDatabaseMariaDB || config.useDatabaseMySQL || config.useDatabasePostgreSQL) {
+			if (targetName.matches(/.*\.(bz2|gz)/) && !(targetName.matches(/.*\.sql\.(bz2|gz)/) || targetName.contains(".tar."))) {
+				String fileExtension = targetName.split(/\./)[-1]
+
+				targetName = targetName.replace(fileExtension, "sql.${fileExtension}")
+			}
+			else if (!targetName.contains(".")) {
+				targetName = "${targetName}.sql"
+			}
+		}
+
 		println "Copying file ${sourcePath} to ${volumeName}"
 		waitForCommand("docker run --rm -v ${volumeName}:/target -v ${sourcePath}:/source/${targetName} busybox:latest sh -c 'cp --recursive --update /source/. /target/'")
 
@@ -120,7 +131,7 @@ ext {
 		String schema ->
 
 		if (config.useDatabaseMariaDB || config.useDatabaseMySQL) {
-			String command = "docker compose exec -it database mysql --user root"
+			String command = "docker compose exec -e MYSQL_PWD=${config.databasePassword} -it database mysql --user ${config.databaseUser}"
 
 			if (schema != null) {
 				command += " --database=${schema}"
@@ -134,7 +145,7 @@ ext {
 				schema = "public"
 			}
 
-			return "docker compose exec -e PGPASSWORD=password -e PGOPTIONS=\"--search_path=${schema}\" -it database psql --username=liferay --dbname=${config.databaseName}"
+			return "docker compose exec -e PGPASSWORD=${config.databasePassword} -e PGOPTIONS=\"--search_path=${schema}\" -it database psql --username=${config.databaseUser} --dbname=${config.databaseName}"
 		}
 
 		if (config.useDatabaseDB2) {
@@ -143,13 +154,13 @@ ext {
 			}
 
 			return [
-				"docker compose exec --user db2admin -it database /opt/ibm/db2/V11.5/bin/db2 connect to ${schema} > /dev/null",
-				"docker compose exec --user db2admin -it database /opt/ibm/db2/V11.5/bin/db2"
+				"docker compose exec --user ${config.databaseUser} -it database /opt/ibm/db2/V11.5/bin/db2 connect to ${schema} > /dev/null",
+				"docker compose exec --user ${config.databaseUser} -it database /opt/ibm/db2/V11.5/bin/db2"
 			].join("\n")
 		}
 
 		if (config.useDatabaseSQLServer) {
-			return "docker compose exec -it database /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C -P Liferay123 -d ${config.databaseName} -Q"
+			return "docker compose exec -it database /opt/mssql-tools18/bin/sqlcmd -S localhost -U ${config.databaseUser} -C -P ${config.databasePassword} -d ${config.databaseName} -Q"
 		}
 	}
 
@@ -197,6 +208,70 @@ ext {
 		config.defaultCompanyVirtualHost = defaultCompanyVirtualHost
 
 		return config.defaultCompanyVirtualHost["webId"]
+	}
+
+	getFirstAvailablePort = {
+		Integer portLowest, Integer portHighest, Set<Integer> projectPorts ->
+
+		logger.info "Finding lowest available port in range: ${portLowest}-${portHighest}"
+
+		for (int port = portLowest; port <= portHighest; port++) {
+			if (projectPorts.contains(port)) {
+				logger.info "Port ${port} is bound by this project, reusing it."
+
+				return port
+			}
+		}
+
+		for (int port = portLowest; port <= portHighest; port++) {
+			try {
+				ServerSocket socket = new ServerSocket(port)
+
+				socket.close()
+
+				logger.info "Port ${port} is available!"
+
+				return port
+			}
+			catch (IOException ex) {
+				logger.info "Port ${port} is in use by another process."
+			}
+		}
+
+		return null
+	}
+
+	getProjectBoundHostPorts = {
+		Set<Integer> boundPorts = new HashSet<>()
+
+		try {
+			String output = waitForCommand(
+				"docker ps --filter 'label=com.docker.compose.project=${config.namespace}' --format '{{.Ports}}'"
+			)
+
+			if (output.isEmpty()) {
+				return boundPorts
+			}
+
+			output.split("\n").each {
+				String line ->
+
+				line.split(",").each {
+					String portMapping ->
+
+					java.util.regex.Matcher matcher = (portMapping.trim() =~ /(?<hostPort>\d+)->/)
+
+					if (matcher.find()) {
+						boundPorts.add(matcher.group("hostPort") as Integer)
+					}
+				}
+			}
+		}
+		catch (Exception e) {
+			logger.info "Unable to query Docker for project ports: ${e.message}"
+		}
+
+		return boundPorts
 	}
 
 	getExistingVolumeNames = {
@@ -353,7 +428,7 @@ ext {
 	}
 
 	waitForCommand = {
-		String command, File cwd = null, OutputStream outputStream = null ->
+		String command, File cwd = null, OutputStream outputStream = null, OutputStream errorStream = null ->
 
 		ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream()
 
@@ -366,6 +441,10 @@ ext {
 			}
 			else {
 				standardOutput byteArrayOutputStream
+			}
+
+			if (errorStream != null) {
+				errorOutput errorStream
 			}
 
 			if (cwd != null) {
@@ -407,6 +486,18 @@ ext {
 				println logs
 			}
 		}
+	}
+}
+
+tasks.register("executeSQLQuery") {
+	doLast {
+		String sqlQueryString = getProperty("sqlQuery")
+
+		if (!sqlQueryString) {
+			return
+		}
+
+		println executeSQLQuery(sqlQueryString, config.databaseName)
 	}
 }
 

@@ -1,9 +1,10 @@
 **/*.iml
 **/*.so
 **/*db2jcc4.jar
-**/*mssql-jdbc-12.10.1.jre11.jar
 **/*dxp-license-*.xml
 **/*hotfix*.zip
+**/*mssql-jdbc-12.10.1.jre11.jar
+**/*xuggle-xuggler-5.4.jar
 **/.classpath
 **/.ivy
 **/.project
@@ -17,12 +18,16 @@
 **/dist
 **/node_modules
 **/node_modules_cache
+**/*server.crt
+**/*server.key
+**/settings.local.json
 **/test-coverage
 **/tmp
 .DS_Store
 .env
 .gradle
 .idea
+keystore.p12
 /bundles
 /containerLogs
 /data/*
@@ -39,5 +44,8 @@
 /plugins-sdk/dependencies/**/*.jar
 /plugins-sdk/dist
 /plugins-sdk/lib
+/scripts/cli/dependencies
+/scripts/tests/resources/
 /shared_workspaces
 test-results
+testDependencies/**/*

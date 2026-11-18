@@ -13,12 +13,26 @@ fi
 
 PROJECT_DIRECTORY=""
 
+_column() {
+	if [[ "$(uname)" == "Darwin" ]]; then
+		if ! command -v "$(brew --prefix util-linux)/bin/column" &>/dev/null; then
+			brew install util-linux
+		fi
+
+		"$(brew --prefix util-linux)/bin/column" "${@}"
+
+		return
+	fi
+
+	column "${@}"
+}
+
 #
 # Helper function for fzf
 #
 
 # shellcheck disable=SC2034
-export FZF_DEFAULT_OPTS="--ansi --color='dark' --height='50'% --info='inline' --reverse"
+export FZF_DEFAULT_OPTS="--ansi --color='dark' --header='Type to filter results' --height='50'% --info='inline' --reverse"
 
 _fzf() {
 	if [[ -x "${LEC_REPO_ROOT}/scripts/cli/dependencies/fzf" ]]; then
@@ -55,13 +69,13 @@ C_RESET=""
 C_YELLOW=""
 
 if [[ -z "${LEC_COLORS_DISABLED}" ]] && tput setaf 1 >/dev/null 2>&1; then
-	C_BLUE=$(tput setaf 6)
-	C_BOLD=$(tput bold)
-	C_GREEN=$(tput setaf 2)
-	C_NC=$(tput op)
-	C_RED=$(tput setaf 1)
-	C_RESET=$(tput sgr0)
-	C_YELLOW=$(tput setaf 3)
+	C_BLUE="$(tput setaf 6)"
+	C_BOLD="$(tput bold)"
+	C_GREEN="$(tput setaf 2)"
+	C_NC="$(tput op)"
+	C_RED="$(tput setaf 1)"
+	C_RESET="$(tput sgr0)"
+	C_YELLOW="$(tput setaf 3)"
 fi
 
 _print() {
@@ -91,10 +105,13 @@ _print_warn() {
 # Control flow functions
 #
 
+_cancel() {
+	echo "Canceled"
+	exit 0
+}
 _cancelIfEmpty() {
 	if [[ -z "${1}" ]]; then
-		echo "Canceled"
-		exit 0
+		_cancel
 	fi
 }
 _errorExit() {
@@ -110,13 +127,22 @@ _printHelpAndExit() {
 
 		${C_BOLD}COMMANDS:${C_RESET}
 		  init [<ticket>] [<version>] [--start]     Create a new Composer project. The "--start" flag starts the Composer project after it is created.
+		  service                                   Select enabled services
 		  start                                     Start a Composer project
 		  stop                                      Stop a Composer project
 		  clean                                     Stop a Composer project and remove Docker volumes
 		  exportData                                Export container data for a Composer project
+		  hotfix                                    Download a hotfix
 		  list [<entity>]                           List entities of a various types
-		  remove                                    Completely tear down and remove one or more Composer projects
-		  share [--export]                          Save a Composer workspace for sharing. The "--export" flag exports the container data before saving the workspace.
+		  ports                                     List exposed ports for a Composer project
+		  remove, rm [<project identifier>]         Completely tear down and remove one or more Composer projects
+		  restart [--clean]                         Restarts a running Composer project. The "--clean" flag removes Docker volumes and images during the shutdown.
+		  share [--export] [--encrypt|--no-encrypt] Save a Composer workspace for sharing. Prompts to encrypt the archive with AES-256.
+		                                            The "--export" flag exports the container data before saving the workspace.
+		                                            The "--encrypt" flag skips the prompt and encrypts the archive.
+		                                            The "--no-encrypt" flag skips the prompt and leaves the archive unencrypted.
+		                                            The LEC_SHARE_ENCRYPT_MODE environment variable sets the default when neither flag is passed.
+		                                            Set it to "1", "true", or "yes" to encrypt, or "0", "false", or "no" to skip encryption.
 		  update [--unstable]                       Check for updates to Composer and lec. The "--unstable" flag updates to latest master branch.
 		  version                                   Prints the current version of lec
 
@@ -124,7 +150,7 @@ _printHelpAndExit() {
 
 		${C_BOLD}FLAGS:${C_RESET}
 		  -p, --project PROJECT_IDENTIFIER          Pass in a project directory or name to commands that operate on a project. If not provided, the current working
-		                                            is used. Supported commands are: clean, exportData, importDLStructure, share, start, and stop.
+		                                            is used. Supported commands are: clean, exportData, hotfix, importDLStructure, remove, share, start, and stop.
 
 		${C_BOLD}SHELL FUNCTIONS:${C_RESET}
 		  lecd [project name]                       Jump to a project
@@ -154,18 +180,29 @@ _prompt() {
 	printf "${C_BOLD}%s${C_RESET}" "${1:?Provide prompt text}"
 	read -r "${2:?Need a variable to write response to}"
 }
+_promptSecret() {
+	printf "${C_BOLD}%s${C_RESET}" "${1:?Provide prompt text}"
+
+	if ! read -r -s "${2:?Need a variable to write response to}"; then
+		echo
+
+		return 1
+	fi
+
+	echo
+}
 _select() {
 	local prompt_message="${1}"
 	shift
 
-	_fzf --prompt "${prompt_message} > " "${@}"
+	_fzf -i --prompt "${prompt_message} > " "${@}"
 }
 
 _selectMultiple() {
 	local prompt_message="${1}"
 	shift
 
-	_fzf --multi --marker="*" --prompt "${prompt_message} > " "${@}"
+	_fzf -i --multi --marker="*" --prompt "${prompt_message} > " "${@}"
 }
 
 #
@@ -261,6 +298,10 @@ _getProjectDir() {
 	local projectDir
 	local projectLocator="${1}"
 
+	if [[ -z "${projectLocator}" ]]; then
+		return 1
+	fi
+
 	projectDir="$(_getProjectRoot "${projectLocator}")"
 	if [[ -d "${projectDir}" ]]; then
 		echo "${projectDir}"
@@ -320,7 +361,7 @@ _checkReleasesJsonFile() {
 	done
 
 	if [[ "${backupJson}" ]]; then
-		echo "${backupJson}" > "${RELEASES_JSON_FILE}"
+		echo "${backupJson}" >"${RELEASES_JSON_FILE}"
 	fi
 
 	return 1
@@ -349,6 +390,12 @@ _checkReleasesJsonFileURL() {
 		"${curl_cmd[@]}"
 		return
 	fi
+}
+
+_showReleasesJsonFile() {
+	_checkReleasesJsonFile
+
+	jq '.' "${RELEASES_JSON_FILE}"
 }
 
 #
@@ -389,6 +436,8 @@ _listSaaSEnvironments() {
 	find "${LXC_REPOSITORY_PATH}/automation/environment-descriptors" -name '*.json' | sed -E 's,^.*/([^/]*).json$,\1,g'
 }
 _listWorktrees() {
+	_git worktree prune
+
 	_git worktree list --porcelain | grep worktree | awk '{print $2}'
 }
 
@@ -416,6 +465,33 @@ _verifyListableEntity() {
 # General helper functions
 #
 
+_clean() {
+	local project_directory="${1}"
+
+	(
+		cd "${project_directory}" || exit
+
+		_print_step "Removing manually deleted worktrees"
+		_git worktree prune
+
+		_print_step "Stopping environment and deleting volumes"
+		./gradlew stop -Plr.docker.environment.clear.volume.data=true
+
+		_print_step "Cleaning the Gradle build"
+		./gradlew clean
+
+		local project_name
+		project_name="$(_getComposeProjectName "${project_directory}")"
+
+		if _projectHasDockerImages "${project_name}"; then
+			_print_step "Removing Docker images..."
+			_listDockerImages "${project_name}" | xargs -I{} docker image rm -f {}
+		fi
+
+		_print_success "Done"
+	)
+}
+
 _getComposeProjectName() {
 	local projectDir="${1}"
 
@@ -425,16 +501,33 @@ _getServicePorts() {
 	local projectDir="${1}"
 	local serviceName="${2}"
 	# shellcheck disable=SC2016
-	local template='table NAME\tCONTAINER PORT\tHOST PORT\n{{$name := .Name}}{{range .Publishers}}{{if eq .URL "0.0.0.0"}}{{$name}}\t{{.TargetPort}}\tlocalhost:{{.PublishedPort}}\n{{end}}{{end}}'
+	local template
+
+	read -r -d '' template <<-'EOF'
+		NAME,CONTAINER PORT,HOST PORT,WEB LINK,NAMESPACED LINK
+		{{range .Publishers -}}
+			{{if eq .URL "0.0.0.0"}}
+				{{- $.Name}},
+				{{- .TargetPort}},
+				{{- .PublishedPort}},
+				{{- if eq .PublishedPort 443}}https{{else}}http{{end}}://localhost:{{.PublishedPort}},
+				{{- "-"}}
+			{{end}}
+		{{- end}}
+	EOF
+
+	local hostname
+	hostname="$(_getComposeProjectName "${projectDir}").localhost"
 
 	(
 		cd "${projectDir}" || exit 1
 
-		if [[ "${serviceName}" ]]; then
-			docker compose ps "${serviceName}" --format "${template}" | tail -n +3
-		else
-			docker compose ps --format "${template}" | tail -n +3
-		fi
+		docker compose ps ${serviceName:+"${serviceName}"} --format "${template}" |
+			sed -E "s@((https?://)localhost:(80|443|8080|8443|9080)),-@\1,\2${hostname}:\3@g" |
+			_column --keep-empty-lines --separator ',' --table |
+			tee /dev/tty |
+			grep -q "${hostname}" &&
+			printf "Tip: Use the 'NAMESPACED LINK' when running multiple projects at once to keep browser sessions isolated.\n"
 	)
 }
 _getWorktreeDir() {
@@ -459,15 +552,6 @@ _removeWorktree() {
 
 	local worktree_name="${worktree##*/}"
 
-	if [[ -d "${worktree}" ]]; then
-		_print_step "Shutting down project and removing Docker volumes..."
-		(
-			cd "${worktree}" || exit 1
-
-			./gradlew stop -Plr.docker.environment.clear.volume.data=true
-		)
-	fi
-
 	_print_step "Removing project dir..."
 	_git worktree remove --force "${worktree_name}"
 
@@ -490,6 +574,57 @@ _selectLiferayRelease() {
 		_listReleases | sed "s,^,${C_GREEN}Release${C_NC}${delimiter},g"
 		_listSaaSEnvironments | sed "s,^,${C_BLUE}LXC${C_NC}    ${delimiter},g"
 	) | _select "${promptMessage}" | awk -F "${delimiter}" '{print $2}'
+}
+_selectServices() {
+	local projectDir="${1}"
+
+	(
+		cd "${projectDir}" || exit
+
+		local all_options
+		all_options=$(grep '^lr.docker.environment.service.enabled' gradle.properties | awk -F'[][]' '{ print $2 }' | sort -u)
+
+		local old_selected
+		old_selected=$(grep '^lr.docker.environment.service.enabled' gradle*.properties | grep -F '=true' | awk -F'[][]' '{ print $2 }')
+
+		local fzf_bind
+		fzf_bind='tab:toggle+clear-query'
+
+		if [ "" != "${old_selected}" ]; then
+			fzf_bind="${fzf_bind},start:select-all+clear-query"
+		fi
+
+		local fzf_query
+		fzf_query="liferay"
+
+		if [ "" != "${old_selected}" ]; then
+			fzf_query="$(echo "${old_selected}" | tr '\n' '|' | sed 's/|/ | /g')"
+		fi
+
+		local new_selected
+		new_selected=$(echo "${all_options}" | _selectMultiple "Choose services to enable (Tab to select multiple)" --bind "${fzf_bind}" --query="${fzf_query}" --sync)
+
+		if [ "" != "${new_selected}" ]; then
+			for item in ${all_options}; do
+				local is_old
+				is_old="$(echo "${old_selected}" | grep -c "^${item}$")"
+
+				local is_new
+				is_new="$(echo "${new_selected}" | grep -c "^${item}$")"
+
+				if [[ ${is_old} -eq 0 ]] && [[ ${is_new} -ne 0 ]]; then
+					_writeProperty "lr.docker.environment.service.enabled\[${item}\]" "true" gradle.properties
+					test -f gradle-local.properties && sed -i.bak "/lr.docker.environment.service.enabled\[${item}\]/d" gradle-local.properties && rm gradle-local.properties.bak
+				elif [[ ${is_old} -ne 0 ]] && [[ ${is_new} -eq 0 ]]; then
+					_writeProperty "lr.docker.environment.service.enabled\[${item}\]" "false" gradle.properties
+					test -f gradle-local.properties && sed -i.bak "/lr.docker.environment.service.enabled\[${item}\]/d" gradle-local.properties && rm gradle-local.properties.bak
+				fi
+			done
+		fi
+
+		_print_success "The following services are enabled:"
+		grep --colour=never '^lr.docker.environment.service.enabled.*=true' gradle*.properties
+	)
 }
 _startProject() {
 	local projectDir="${1}"
@@ -529,6 +664,21 @@ _isReleaseVersion() {
 	local liferay_version="${1}"
 
 	_listReleases | grep -q "^${liferay_version}$"
+}
+
+_listDockerImages() {
+	local project_name="${1}"
+
+	if [[ -z "${project_name}" ]]; then
+		return
+	fi
+
+	docker image ls --format "{{.Repository}}" | grep -i -F "${project_name}" | grep -i "^${project_name}-"
+}
+_projectHasDockerImages() {
+	local projectName="${1}"
+
+	_listDockerImages "${projectName}" &>/dev/null
 }
 _verifyLiferayVersion() {
 	local liferay_version="${1}"
@@ -607,6 +757,13 @@ _writeProperty() {
 # PRIVATE COMMAND DEFINITIONS
 #
 
+_cmd_bats() {
+	git submodule update --init --recursive
+
+	export BATS_FILE_EXTENSION="test.sh"
+
+	"${LEC_REPO_ROOT}/scripts/vendor/bats/bin/bats" "${@}"
+}
 _cmd_commands() {
 	printf "\n${C_BOLD}%s${C_RESET}\n\n" "Public Commands:"
 	_listPublicCommands | sed 's,^,  ,g'
@@ -614,11 +771,47 @@ _cmd_commands() {
 	printf "\n${C_BOLD}%s${C_RESET}\n\n" "Private Commands:"
 	_listPrivateCommands | sed 's,^,  ,g'
 }
+_cmd_completions() {
+	local type="${1}"
+
+	case "${type}" in
+	commands)
+		_listPublicCommands
+		;;
+	entities)
+		_listPrefixedFunctions _list_
+		;;
+	flags)
+		local command="${2}"
+
+		case "${command}" in
+		init)
+			echo "--service"
+			echo "--start"
+			;;
+		restart)
+			echo "--clean"
+			;;
+		share)
+			echo "--encrypt"
+			echo "--export"
+			echo "--no-encrypt"
+			;;
+		update)
+			echo "--unstable"
+			;;
+		esac
+		;;
+	projects)
+		_list_projects
+		;;
+	esac
+}
 _cmd_fn() {
 	"${1}" "${@:2}"
 }
 _cmd_gw() {
-	_checkProjectDirectory
+	_checkProjectDirectory "${PWD}"
 
 	(
 		cd "${PROJECT_DIRECTORY}" || exit
@@ -626,15 +819,45 @@ _cmd_gw() {
 		./gradlew "${@}"
 	)
 }
-_cmd_ports() {
-	_checkProjectDirectory
+_cmd_setupLocalFzf() {
+	local pattern
 
-	local serviceName="${1}"
+	if [[ -f scripts/cli/dependencies/fzf ]]; then
+		rm scripts/cli/dependencies/fzf
+	fi
 
-	_getServicePorts "${PROJECT_DIRECTORY}" "${serviceName}"
+	pattern="$(gh -R junegunn/fzf release view 0.29.0 --json assets --jq ".assets.[].name" | grep -v checksum | _fzf)"
+
+	if [[ -z "${pattern}" ]]; then
+		return 1
+	fi
+
+	gh -R junegunn/fzf release download 0.29.0 --pattern="*${pattern}" --clobber
+
+	case "${pattern}" in
+	*.zip)
+		echo "Extracting ZIP archive: ${pattern}"
+		unzip -o "${pattern}" -d scripts/cli/dependencies || exit 1
+		;;
+	*.tar.gz | *.tgz)
+		echo "Extracting TGZ archive: ${pattern}"
+		tar -xzf "${pattern}" -C scripts/cli/dependencies
+		;;
+	*)
+		echo "Unsupported archive type or unknown file extension: ${pattern}"
+		echo "Please use '.zip' or '.tar.gz' (or '.tgz') files."
+		exit 1
+		;;
+	esac
+
+	if [[ -f "${pattern}" ]]; then
+		rm "${pattern}"
+	fi
+
+	_fzf --version
 }
 _cmd_setVersion() {
-	_checkProjectDirectory
+	_checkProjectDirectory "${PWD}"
 
 	local liferay_version
 
@@ -649,46 +872,28 @@ _cmd_setVersion() {
 #
 
 cmd_clean() {
-	_checkProjectDirectory
+	_checkProjectDirectory "${PWD}"
 
-	(
-		cd "${PROJECT_DIRECTORY}" || exit
+	local project_name
+	project_name="$(_getComposeProjectName "${PROJECT_DIRECTORY}")"
 
-		local docker_images
-		docker_images="$(docker image ls | grep "^$(_getComposeProjectName "${PROJECT_DIRECTORY}")" | awk '{print $1}')"
+	if _projectHasDockerImages "${project_name}"; then
+		_print_warn "This will stop the Docker compose project, remove the Docker volumes, and remove the following Docker images:"
+		echo ""
+		printf "${C_YELLOW}%s${C_NC}\n" "$(_listDockerImages "${project_name}")"
+		echo ""
+	else
+		_print_warn "This will stop the Docker compose project and remove the Docker volumes."
+	fi
 
-		if [[ "${docker_images}" ]]; then
-			_print_warn "This will stop the Docker compose project, remove the Docker volumes, and remove the following Docker images:"
-			echo ""
-			printf "${C_YELLOW}%s${C_NC}\n" "${docker_images}"
-			echo ""
-		else
-			_print_warn "This will stop the Docker compose project and remove the Docker volumes."
-		fi
+	if ! _confirm "Do you want to continue?"; then
+		return
+	fi
 
-		if ! _confirm "Do you want to continue?"; then
-			return
-		fi
-
-		_print_step "Removing manually deleted worktrees"
-		_git worktree prune
-
-		_print_step "Stopping environment and deleting volumes"
-		./gradlew stop -Plr.docker.environment.clear.volume.data=true
-
-		_print_step "Cleaning the Gradle build"
-		./gradlew clean
-
-		if [[ "${docker_images}" ]]; then
-			_print_step "Removing Docker images..."
-			docker image ls | grep "^$(_getComposeProjectName "${PROJECT_DIRECTORY}")" | awk '{print $3}' | xargs -I{} docker image rm {}
-		fi
-
-		_print_success "Done"
-	)
+	_clean "${PROJECT_DIRECTORY}"
 }
 cmd_exportData() {
-	_checkProjectDirectory
+	_checkProjectDirectory "${PWD}"
 
 	_print_step "Exporting container data..."
 
@@ -700,13 +905,55 @@ cmd_exportData() {
 		fi
 
 		local exportedDataRelativeDir
-		exportedDataRelativeDir=$(grep lr.docker.environment.data.directory gradle-local.properties | sed "s,.*=,,g")
+		exportedDataRelativeDir="$(grep lr.docker.environment.data.directory gradle-local.properties | sed "s,.*=,,g")"
 
 		_print_success "Container data exported to ${PROJECT_DIRECTORY}/${exportedDataRelativeDir}"
 	)
 }
+cmd_hotfix() {
+	_checkProjectDirectory "${PWD}"
+
+	(
+		cd "${PROJECT_DIRECTORY}" || exit
+
+		local dxpVersion
+		dxpVersion=$(grep '^liferay.workspace.product=' gradle.properties | cut -d'=' -f 2 | sed 's/^dxp-//g')
+
+		if [[ ${dxpVersion} == 7.0* ]]; then
+			dxpVersion=7.0.10
+		elif [[ ${dxpVersion} == 7.1* ]]; then
+			dxpVersion=7.1.10
+		elif [[ ${dxpVersion} == 7.2* ]]; then
+			dxpVersion=7.2.10
+		elif [ "${dxpVersion}" == "7.3-u36" ]; then
+			dxpVersion=7.3.10-u36
+		elif [[ ${dxpVersion} == 7.3* ]]; then
+			dxpVersion=7.3.10
+		elif [[ ${dxpVersion} == 7.4* ]]; then
+			dxpVersion=7.4.13
+		fi
+
+		local hotfixFileName
+		hotfixFileName=$(curl -s "https://hotfixes.liferay.com/${dxpVersion}/" | grep -o '<a href="[^"]*">' | cut -d'"' -f 2 | grep 'hotfix-' | _select "Select a hotfix number" --exact --query="hotfix-")
+
+		if [ "" == "${hotfixFileName}" ]; then
+			exit 0
+		fi
+
+		local hotfixLocalPath
+		hotfixLocalPath="configs/common/patching/${hotfixFileName}"
+
+		local hotfixURL
+		hotfixURL="https://hotfixes.liferay.com/${dxpVersion}/${hotfixFileName}"
+
+		test ! -f "${hotfixLocalPath}" && _print_step "Downloading hotfix ${hotfixURL}" && curl --progress-bar "${hotfixURL}" --output "${hotfixLocalPath}"
+		_writeProperty "lr.docker.environment.hotfix.urls" "${hotfixURL}" gradle.properties
+	)
+
+	_print_success "$(grep --colour=never '^lr.docker.environment.hotfix.urls=' gradle.properties)"
+}
 cmd_importDLStructure() {
-	_checkProjectDirectory
+	_checkProjectDirectory "${PWD}"
 
 	local sourceDir="${1}"
 	local targetDir="${PROJECT_DIRECTORY}/configs/common/data/document_library"
@@ -737,17 +984,21 @@ cmd_importDLStructure() {
 }
 cmd_init() {
 	local ARGS=()
+	local FLAG_SERVICE=0
 	local FLAG_START=0
 
 	while [[ $# -gt 0 ]]; do
 		case "${1}" in
-			--start)
-				shift && FLAG_START=1
-				;;
-			*)
-				ARGS+=("${1}")
-				shift
-				;;
+		--service)
+			shift && FLAG_SERVICE=1
+			;;
+		--start)
+			shift && FLAG_START=1
+			;;
+		*)
+			ARGS+=("${1}")
+			shift
+			;;
 		esac
 	done
 
@@ -779,6 +1030,7 @@ cmd_init() {
 		fi
 
 		_print_step "Cleaning up left over project data..."
+		_clean "${existing_worktree_path}"
 		_removeWorktree "${existing_worktree_path}"
 	fi
 
@@ -804,6 +1056,10 @@ cmd_init() {
 
 	_print_success "Created new Liferay Environment Composer project at ${C_BLUE}${worktree_dir}${C_NC}"
 
+	if [[ "${FLAG_SERVICE}" -gt 0 ]]; then
+		_selectServices "${worktree_dir}"
+	fi
+
 	if [[ "${FLAG_START}" -gt 0 ]]; then
 		_print_step "Starting workspace"
 		_startProject "${worktree_dir}"
@@ -822,10 +1078,10 @@ cmd_list() {
 	fi
 
 	if ! _verifyListableEntity "${entity}"; then
-		closest_entity=$(_listPrefixedFunctions _list_| _fzf --filter "${entity}" | head -n 1)
+		closest_entity="$(_listPrefixedFunctions _list_ | _fzf --filter "${entity}" | head -n 1)"
 
 		if _verifyListableEntity "${closest_entity}" && _confirm "Entity \"${entity}\" is unknown. Use closest entity \"${closest_entity}\" instead?"; then
-			entity=${closest_entity}
+			entity="${closest_entity}"
 		else
 			_print_error "Cannot list ${C_YELLOW}${entity}${C_NC}. Showing listable entities..."
 
@@ -837,43 +1093,205 @@ cmd_list() {
 
 	_list_"${entity}"
 }
-cmd_remove() {
-	local worktrees
-	worktrees="$(_listWorktrees | grep -E -v "^${LIFERAY_ENVIRONMENT_COMPOSER_HOME}$" | _selectMultiple "Choose projects to remove (Tab to select multiple)")"
-	_cancelIfEmpty "${worktrees}"
+cmd_ports() {
+	_checkProjectDirectory "${PWD}"
 
-	printf "${C_BOLD}Projects to be removed:\n\n${C_YELLOW}%s${C_RESET}\n\n" "${worktrees}"
+	local serviceName="${1}"
+
+	_getServicePorts "${PROJECT_DIRECTORY}" "${serviceName}"
+}
+cmd_remove() {
+	local locator="${1}"
+	local worktrees=()
+
+	if [[ "${OPTION_PROJECT}" ]]; then
+		_checkProjectDirectory
+
+		worktrees+=("${PROJECT_DIRECTORY}")
+	fi
+
+	if [[ "${locator}" ]]; then
+		local projectDir
+		projectDir="$(_getProjectDir "${locator}")"
+
+		if [[ ! -d "${projectDir}" ]]; then
+			_errorExit "Cannot get a valid project for ${locator}"
+		fi
+
+		worktrees+=("${projectDir}")
+	fi
+
+	if [[ "${#worktrees[@]}" -eq 0 ]]; then
+		while IFS= read -r line; do
+			worktrees+=("$line")
+		done < <(_listWorktrees | grep -E -v "^${LIFERAY_ENVIRONMENT_COMPOSER_HOME}$" | _selectMultiple "Choose projects to remove (Tab to select multiple)")
+	fi
+
+	_cancelIfEmpty "${worktrees[*]}"
+
+	# shellcheck disable=SC2059
+	printf "${C_BOLD}Projects to be removed:\n\n${C_RESET}"
+	printf "${C_BOLD}${C_YELLOW}%s${C_RESET}\n" "${worktrees[@]}"
+	echo ""
 
 	if ! _confirm "Are you sure you want to remove them? This cannot be undone."; then
 		return 1
 	fi
 
-	for worktree in ${worktrees}; do
+	for worktree in "${worktrees[@]}"; do
 		_print_step "Removing project ${C_YELLOW}${worktree}${C_NC}"
+		_clean "${worktree}"
 		_removeWorktree "${worktree}"
 		echo
 	done
 }
-cmd_share() {
-	_checkProjectDirectory
+cmd_restart() {
+	_checkProjectDirectory "${PWD}"
 
-	local FLAG_EXPORT=0
+	local FLAG_CLEAN=0
 
 	while [[ $# -gt 0 ]]; do
 		case "${1}" in
-			--export)
-				shift && FLAG_EXPORT=1
-				;;
-			*)
-				shift
-				;;
+		--clean)
+			shift && FLAG_CLEAN=1
+			;;
+		*)
+			shift
+			;;
 		esac
 	done
+
+	if [[ "${FLAG_CLEAN}" -gt 0 ]]; then
+		_clean "${PROJECT_DIRECTORY}"
+	else
+		(
+			cd "${PROJECT_DIRECTORY}" || exit
+
+			_print_step "Stopping environment ${C_BLUE}${PROJECT_DIRECTORY}${C_NC}"
+			./gradlew stop
+
+			_print_success "Done"
+		)
+	fi
+
+	_print_step "Starting environment"
+	if ! _startProject "${PROJECT_DIRECTORY}"; then
+		exit 1
+	fi
+
+	_print_step "Printing published ports"
+	_getServicePorts "${PROJECT_DIRECTORY}"
+
+	_print_step "Tailing logs"
+	_tailProjectLogs "${PROJECT_DIRECTORY}"
+}
+cmd_rm() {
+	cmd_remove "${@}"
+}
+cmd_service() {
+	_checkProjectDirectory "${PWD}"
 
 	(
 		cd "${PROJECT_DIRECTORY}" || exit
 
-		if [[ "${FLAG_EXPORT}" -gt 1 ]]; then
+		_selectServices "${PROJECT_DIRECTORY}"
+	)
+}
+cmd_share() {
+	_checkProjectDirectory "${PWD}"
+
+	local FLAG_ENCRYPT=0
+	local FLAG_EXPORT=0
+	local FLAG_NO_ENCRYPT=0
+
+	while [[ $# -gt 0 ]]; do
+		case "${1}" in
+		--encrypt)
+			shift && FLAG_ENCRYPT=1
+			;;
+		--export)
+			shift && FLAG_EXPORT=1
+			;;
+		--no-encrypt)
+			shift && FLAG_NO_ENCRYPT=1
+			;;
+		*)
+			shift
+			;;
+		esac
+	done
+
+	if [[ "${FLAG_ENCRYPT}" -gt 0 && "${FLAG_NO_ENCRYPT}" -gt 0 ]]; then
+		_errorExit "The \"--encrypt\" and \"--no-encrypt\" flags cannot be used together."
+	fi
+
+	local ENCRYPT=""
+
+	if [[ "${FLAG_ENCRYPT}" -gt 0 ]]; then
+		ENCRYPT=1
+	elif [[ "${FLAG_NO_ENCRYPT}" -gt 0 ]]; then
+		ENCRYPT=0
+	elif [[ -n "${LEC_SHARE_ENCRYPT_MODE}" ]]; then
+		case "${LEC_SHARE_ENCRYPT_MODE}" in
+		1|true|yes)
+			ENCRYPT=1
+			;;
+		0|false|no)
+			ENCRYPT=0
+			;;
+		*)
+			_errorExit "\"${LEC_SHARE_ENCRYPT_MODE}\" is not a valid value for LEC_SHARE_ENCRYPT_MODE. Use \"1\", \"true\", or \"yes\" to encrypt, or \"0\", \"false\", or \"no\" to skip encryption."
+			;;
+		esac
+	fi
+
+	(
+		cd "${PROJECT_DIRECTORY}" || exit
+
+		if [[ -z "${ENCRYPT}" ]]; then
+			ENCRYPT=0
+
+			if _confirm "Encrypt the workspace archive with AES-256?"; then
+				ENCRYPT=1
+			fi
+		fi
+
+		local password
+		local password_confirmation
+
+		if [[ "${ENCRYPT}" -gt 0 ]]; then
+			if ! _is_program 7z; then
+				_errorExit "The 7z CLI must be installed in order to encrypt workspace archives. Follow the install instructions at https://7-zip.org/download.html."
+			fi
+
+			_print_step "Create a password in 1Password and paste it below."
+
+			while true; do
+				if ! _promptSecret "Password: " password; then
+					_cancel
+				fi
+
+				if [[ -z "${password}" ]]; then
+					_print_warn "Password cannot be empty."
+
+					continue
+				fi
+
+				if ! _promptSecret "Confirm password: " password_confirmation; then
+					_cancel
+				fi
+
+				if [[ "${password}" != "${password_confirmation}" ]]; then
+					_print_warn "Passwords do not match."
+
+					continue
+				fi
+
+				break
+			done
+		fi
+
+		if [[ "${FLAG_EXPORT}" -gt 0 ]]; then
 			_print_step "Exporting container data..."
 
 			if ! ./gradlew exportContainerData --quiet; then
@@ -881,9 +1299,13 @@ cmd_share() {
 			fi
 		fi
 
-		_print_step "Zipping up workspace..."
+		if [[ "${ENCRYPT}" -gt 0 ]]; then
+			_print_step "Zipping and encrypting workspace..."
+		else
+			_print_step "Zipping up workspace..."
+		fi
 
-		if ! ./gradlew shareWorkspace | grep -E "Workspace zip|workspace archive"; then
+		if ! ./gradlew shareWorkspace -ParchivePassword="${password}" | grep -E "Workspace zip|workspace archive"; then
 			exit 1
 		fi
 
@@ -891,10 +1313,12 @@ cmd_share() {
 	)
 }
 cmd_start() {
-	_checkProjectDirectory
+	_checkProjectDirectory "${PWD}"
 
 	_print_step "Starting environment"
-	_startProject "${PROJECT_DIRECTORY}"
+	if ! _startProject "${PROJECT_DIRECTORY}"; then
+		exit 1
+	fi
 
 	_print_step "Printing published ports"
 	_getServicePorts "${PROJECT_DIRECTORY}"
@@ -903,7 +1327,7 @@ cmd_start() {
 	_tailProjectLogs "${PROJECT_DIRECTORY}"
 }
 cmd_stop() {
-	_checkProjectDirectory
+	_checkProjectDirectory "${PWD}"
 
 	(
 		cd "${PROJECT_DIRECTORY}" || exit
@@ -923,12 +1347,12 @@ cmd_update() {
 
 	while [[ $# -gt 0 ]]; do
 		case "${1}" in
-			--unstable)
-				shift && FLAG_UNSTABLE=1
-				;;
-			*)
-				shift
-				;;
+		--unstable)
+			shift && FLAG_UNSTABLE=1
+			;;
+		*)
+			shift
+			;;
 		esac
 	done
 
@@ -972,8 +1396,8 @@ cmd_update() {
 
 	_git fetch "${remote}" --tags
 
-	current_tag=$(_git describe --tags 2>/dev/null)
-	latest_tag=$(_git tag --list 'v*' | sort -V | tail -1)
+	current_tag="$(_git describe --tags 2>/dev/null)"
+	latest_tag="$(_git tag --list 'v*' | sort -V | tail -1)"
 
 	if [[ "${current_tag}" == "${latest_tag}" ]]; then
 		_print_success "Current version ${C_BLUE}${current_tag}${C_NC} is up to date"
@@ -1006,32 +1430,42 @@ cmd_version() {
 _check_dependencies
 
 COMMAND=""
-OPTION_PROJECT="${PWD}"
+OPTION_PROJECT=""
 REST_ARGS=()
 
 while [[ $# -gt 0 ]]; do
 	case "${1}" in
-		-p|--project)
-			OPTION_PROJECT="${2}"
-			[[ "${2}" ]] || _errorExit "${1} requires a value"
-			shift
-			shift
-			;;
-		*)
-			if [[ -z "${COMMAND}" ]]; then
-				COMMAND="${1}"
-			else
-				REST_ARGS+=("${1}")
-			fi
-			shift
-			;;
+	-p | --project)
+		OPTION_PROJECT="${2}"
+		[[ "${2}" ]] || _errorExit "${1} requires a value"
+		shift
+		shift
+		;;
+	*)
+		if [[ -z "${COMMAND}" ]]; then
+			COMMAND="${1}"
+		else
+			REST_ARGS+=("${1}")
+		fi
+		shift
+		;;
 	esac
 done
 
+#
+# Helper function to check for a valid project directory.
+#
+# It resolves the locator into a global PROJECT_DIRECTORY variable.
+# It prioritizes the explicitly provided -p/--project flag (OPTION_PROJECT).
+# If no flag is provided, it uses the first argument ($1) as a fallback.
+# It will exit with an error if no valid project can be determined.
+#
 _checkProjectDirectory() {
-	PROJECT_DIRECTORY="$(_getProjectDir "${OPTION_PROJECT}")"
+	local locator="${OPTION_PROJECT:-$1}"
 
-	test -d "${PROJECT_DIRECTORY}" || _errorExit "Cannot get a valid project for ${OPTION_PROJECT}"
+	PROJECT_DIRECTORY="$(_getProjectDir "${locator}")"
+
+	test -d "${PROJECT_DIRECTORY}" || _errorExit "Cannot get a valid project for ${locator}"
 
 	echo "Project directory: ${C_BOLD}${PROJECT_DIRECTORY}${C_RESET}" 1>&2
 }

@@ -6,9 +6,10 @@ if [[ -z "${LEC_REPO_ROOT}" ]]; then
 	return
 fi
 
-# Set the alias to the main script
-# shellcheck disable=SC2139
-alias lec="$LEC_REPO_ROOT/scripts/cli/lec.sh"
+# Shell function for the main script
+function lec() {
+	"$LEC_REPO_ROOT/scripts/cli/lec.sh" "$@"
+}
 
 # Util function to allow quickly jumping to a project
 function lecd() {
@@ -55,3 +56,53 @@ function lec-init() {
 		cd "${workspace_dir}" || return 1
 	fi
 }
+
+function _lec_completions() {
+	local cmd=()
+	local cur="${COMP_WORDS[COMP_CWORD]}"
+
+	if [ "${#COMP_WORDS[@]}" == "2" ]; then
+		cmd=(commands)
+	else
+		local lec_cmd="${COMP_WORDS[1]}"
+		case "${lec_cmd}" in
+		list)
+			cmd=(entities)
+			;;
+		rm|remove)
+			cmd=(projects)
+			;;
+		*)
+			local prev="${COMP_WORDS[COMP_CWORD - 1]}"
+
+			case "${prev}" in
+			-p|--project)
+				cmd=(projects)
+				;;
+			*)
+				cmd=(flags "${lec_cmd}")
+				;;
+			esac
+			;;
+		esac
+	fi
+
+	local compgen_opts
+	compgen_opts="$(lec completions "${cmd[@]}")"
+
+	local comp_word
+	for comp_word in "${COMP_WORDS[@]:2}"; do
+		compgen_opts=$(echo "$compgen_opts" | grep -v "^${comp_word}$")
+	done
+
+	# shellcheck disable=SC2207
+	COMPREPLY=($(compgen -W "${compgen_opts}" -- "${cur}"))
+
+	return 0
+}
+
+if [[ -n "${ZSH_VERSION}" ]]; then
+	autoload -U bashcompinit && bashcompinit
+fi
+
+complete -F _lec_completions lec
